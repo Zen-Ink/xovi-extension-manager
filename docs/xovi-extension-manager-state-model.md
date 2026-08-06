@@ -105,14 +105,14 @@ whether XOVI has already loaded a plugin in the current process:
 For native `.so` extensions, the manager compares these default paths:
 
 ```text
-source: /home/root/xovi/exthome/<id>/<entry>
+source: /home/root/xovi/extensions.available/<id>/<entry>
 active: /home/root/xovi/extensions.d/<id>.so
 ```
 
 For QMD packages, the manager compares these default paths:
 
 ```text
-source: /home/root/xovi/exthome/xovi-extension-manager/qmd/<id>/<entry>
+source: /home/root/xovi/qmd.available/<id>/<entry>
 active: /home/root/xovi/exthome/qt-resource-rebuilder/<order>-<id>.qmd
 ```
 

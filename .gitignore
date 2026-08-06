@@ -1,4 +1,6 @@
 manifest.json
+xovi.cpp
+xovi.h
 *.so
 *.o
 rcc/

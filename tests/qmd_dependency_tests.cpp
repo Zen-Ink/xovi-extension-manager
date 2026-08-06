@@ -44,9 +44,19 @@ public:
                 bool enabled,
                 const std::vector<std::pair<std::string, std::string>> &qmdDependencies = {},
                 bool active = false) {
+        addQmdWithEntry(id, version, order, id + ".qmd", enabled, qmdDependencies, active);
+    }
+
+    void addQmdWithEntry(const std::string &id,
+                         const std::string &version,
+                         int order,
+                         const std::string &entry,
+                         bool enabled,
+                         const std::vector<std::pair<std::string, std::string>> &qmdDependencies = {},
+                         bool active = false) {
         fs::path package = qmdPackages() / id;
         fs::create_directories(package);
-        write(package / (id + ".qmd"), "// test fixture\n");
+        write(package / entry, "// test fixture\n");
 
         std::ostringstream dependencies;
         dependencies << "{";
@@ -64,7 +74,7 @@ public:
                  << "  \"id\": \"" << id << "\",\n"
                  << "  \"name\": \"" << id << "\",\n"
                  << "  \"version\": \"" << version << "\",\n"
-                 << "  \"entry\": \"" << id << ".qmd\",\n"
+                 << "  \"entry\": \"" << entry << "\",\n"
                  << "  \"enabled\": " << (enabled ? "true" : "false") << ",\n"
                  << "  \"order\": " << order << ",\n"
                  << "  \"requires\": {\n"
@@ -79,7 +89,7 @@ public:
 
         if(active) {
             fs::create_directories(qmdActive());
-            fs::create_symlink(package / (id + ".qmd"), qmdActive() / activeName(order, id));
+            fs::create_symlink(package / entry, qmdActive() / activeName(order, id));
         }
     }
 
@@ -89,15 +99,35 @@ public:
     }
 
     void addExtensionWithId(const std::string &id) {
-        fs::path package = root_ / "exthome" / id;
+        addExtension(id, "1.0.0", true, false);
+    }
+
+    void addExtension(const std::string &id,
+                      const std::string &version,
+                      bool enabled,
+                      bool active) {
+        addExtensionWithEntry(id, version, id + ".so", enabled, active);
+    }
+
+    void addExtensionWithEntry(const std::string &id,
+                               const std::string &version,
+                               const std::string &entry,
+                               bool enabled,
+                               bool active) {
+        fs::path package = extensionPackages() / id;
         fs::create_directories(package);
-        write(package / (id + ".so"), "test extension fixture\n");
+        write(package / entry, "test extension fixture\n");
         write(package / "manifest.json",
               "{\"manifestVersion\":1,\"type\":\"extension\","
               "\"id\":\"" + id + "\",\"name\":\"" + id + "\","
-              "\"version\":\"1.0.0\",\"entry\":\"" + id + ".so\","
-              "\"enabled\":true,\"requires\":{\"xovi\":\">=0.3.0\","
+              "\"version\":\"" + version + "\",\"entry\":\"" + entry + "\","
+              "\"enabled\":" + std::string(enabled ? "true" : "false") + ",\"requires\":{\"xovi\":\">=0.3.0\","
               "\"extensions\":{},\"xochitl\":[],\"architectures\":[]}}\n");
+        if(active) {
+            fs::path activeDir = root_ / "extensions.d";
+            fs::create_directories(activeDir);
+            fs::create_symlink(package / entry, activeDir / (id + ".so"));
+        }
     }
 
     void addDuplicateQmd(const std::string &directory, const std::string &id, int order) {
@@ -119,8 +149,35 @@ public:
         return qmdPackages() / id;
     }
 
+    fs::path extensionPackage(const std::string &id) const {
+        return extensionPackages() / id;
+    }
+
+    fs::path dataHome(const std::string &id) const {
+        return root_ / "exthome" / id;
+    }
+
     bool activeQmdExists(int order, const std::string &id) const {
         return fs::exists(qmdActive() / activeName(order, id));
+    }
+
+    bool activeExtensionExists(const std::string &id) const {
+        return fs::exists(root_ / "extensions.d" / (id + ".so"));
+    }
+
+    void writeDataFile(const std::string &id,
+                       const std::string &relativePath,
+                       const std::string &contents) {
+        write(dataHome(id) / relativePath, contents);
+    }
+
+    bool dataFileExists(const std::string &id, const std::string &relativePath) const {
+        return fs::exists(dataHome(id) / relativePath);
+    }
+
+    fs::path previousSelfPackage() const {
+        return root_ / "exthome" / "xovi-extension-manager" /
+               "state" / "previous" / "xovi-extension-manager";
     }
 
     std::string installQmdUpdate(const std::string &id,
@@ -153,11 +210,30 @@ public:
         return installPackage("{\"path\":\"" + incoming.string() + "\",\"enabled\":true}");
     }
 
+    std::string installExtensionUpdate(const std::string &id,
+                                       const std::string &version,
+                                       bool enabled = true) {
+        fs::path incoming = root_ / "incoming" / (id + ".so");
+        write(incoming, "updated extension fixture\n");
+        std::string manifest = "{\"manifestVersion\":1,\"type\":\"extension\","
+            "\"id\":\"" + id + "\",\"name\":\"" + id + "\","
+            "\"version\":\"" + version + "\",\"entry\":\"" + id + ".so\","
+            "\"enabled\":" + std::string(enabled ? "true" : "false") + ","
+            "\"requires\":{\"xovi\":\">=0.3.0\","
+            "\"extensions\":{},\"xochitl\":[],\"architectures\":[]}}\n";
+        write(fs::path(incoming.string() + ".manifest.json"), manifest);
+        return installPackage("{\"path\":\"" + incoming.string() + "\"}");
+    }
+
 private:
     fs::path root_;
 
+    fs::path extensionPackages() const {
+        return root_ / "extensions.available";
+    }
+
     fs::path qmdPackages() const {
-        return root_ / "exthome" / "xovi-extension-manager" / "qmd";
+        return root_ / "qmd.available";
     }
 
     fs::path qmdActive() const {
@@ -180,7 +256,7 @@ private:
     }
 
     void addRuntimeExtension() {
-        fs::path package = root_ / "exthome" / "qt-resource-rebuilder";
+        fs::path package = extensionPackages() / "qt-resource-rebuilder";
         fs::create_directories(package);
         write(package / "qt-resource-rebuilder.so", "test fixture\n");
         write(package / "manifest.json",
@@ -337,6 +413,93 @@ void successfulDependency() {
     requireNotContains(json, "qmd-dependency-cycle:");
 }
 
+void availableRootsAreCanonical() {
+    Fixture fixture;
+    fixture.addExtension("native", "1.0.0", true, true);
+    fixture.addQmd("base", "1.0.0", 10, true, {}, true);
+
+    std::string extensionJson = packageJson(loadInventory(false), "native");
+    requireContains(extensionJson, "extensions.available/native");
+    requireContains(extensionJson, "extensions.available/native/native.so");
+    requireContains(extensionJson, "\"dataPath\":\"");
+    requireContains(extensionJson, "exthome/native");
+
+    std::string qmdJson = packageJson(loadInventory(false), "base");
+    requireContains(qmdJson, "qmd.available/base");
+    requireContains(qmdJson, "qmd.available/base/base.qmd");
+}
+
+void entryMayUseSafeRelativeSubdirectory() {
+    Fixture fixture;
+    fixture.addExtensionWithEntry("nested-native", "1.0.0", "lib/nested-native.so", true, true);
+    fixture.addQmdWithEntry("nested-qmd", "1.0.0", 10, "qmd/nested-qmd.qmd", true, {}, true);
+
+    std::string extensionJson = packageJson(loadInventory(false), "nested-native");
+    requireContains(extensionJson, "\"entry\":\"lib/nested-native.so\"");
+    requireContains(extensionJson, "extensions.available/nested-native/lib/nested-native.so");
+    requireContains(extensionJson, "\"sourceEntryExists\":true");
+    requireContains(extensionJson, "\"activeEntryMatches\":true");
+
+    std::string qmdJson = packageJson(loadInventory(false), "nested-qmd");
+    requireContains(qmdJson, "\"entry\":\"qmd/nested-qmd.qmd\"");
+    requireContains(qmdJson, "qmd.available/nested-qmd/qmd/nested-qmd.qmd");
+    requireContains(qmdJson, "\"sourceEntryExists\":true");
+    requireContains(qmdJson, "\"activeEntryMatches\":true");
+}
+
+void typedPathMatchesFullEntryBeforeBasename() {
+    Fixture fixture;
+    fixture.addExtensionWithEntry("flat-entry", "1.0.0", "same.so", false, false);
+    fixture.addExtensionWithEntry("nested-entry", "1.0.0", "lib/same.so", false, false);
+
+    std::string result = removeManagedPackage("{\"type\":\"extension\",\"path\":\"lib/same.so\"}");
+    requireContains(result, "\"ok\":true");
+    requireContains(result, "\"id\":\"nested-entry\"");
+    require(!fs::exists(fixture.extensionPackage("nested-entry")),
+            "full entry path did not remove the nested-entry package");
+    require(fs::exists(fixture.extensionPackage("flat-entry")),
+            "full entry path matched another package by basename");
+}
+
+void reinstallPreservesRuntimeDataHome() {
+    Fixture fixture;
+    fixture.addExtension("native", "1.0.0", true, true);
+    fixture.writeDataFile("native", "data/user.json", "{\"kept\":true}\n");
+
+    std::string result = fixture.installExtensionUpdate("native", "1.1.0");
+    requireContains(result, "\"ok\":true");
+    require(fixture.dataFileExists("native", "data/user.json"),
+            "extension reinstall removed runtime data under exthome/<id>");
+    requireContains(packageJson(loadInventory(false), "native"), "\"version\":\"1.1.0\"");
+}
+
+void selfDisableBlocked() {
+    Fixture fixture;
+    fixture.addExtension("xovi-extension-manager", "1.0.0", true, true);
+
+    std::string result = setExtensionEnabled("xovi-extension-manager", false);
+    requireContains(result, "\"ok\":false");
+    requireContains(result, "self-disable-blocked");
+    std::string json = packageJson(loadInventory(false), "xovi-extension-manager");
+    requireNotContains(json, "\"disable\"");
+    requireNotContains(json, "\"remove\"");
+}
+
+void selfUpgradePreservesPreviousPackage() {
+    Fixture fixture;
+    fixture.addExtension("xovi-extension-manager", "1.0.0", true, true);
+
+    std::string result = fixture.installExtensionUpdate("xovi-extension-manager", "1.1.0", false);
+    requireContains(result, "\"ok\":true");
+    requireContains(result, "self-package-forced-enabled");
+    requireContains(result, "previous-self-package-preserved");
+    require(fs::exists(fixture.previousSelfPackage() / "xovi-extension-manager.so"),
+            "self upgrade did not preserve previous package");
+    require(fixture.activeExtensionExists("xovi-extension-manager"),
+            "self upgrade removed active extension symlink");
+    requireContains(packageJson(loadInventory(false), "xovi-extension-manager"), "\"version\":\"1.1.0\"");
+}
+
 void disableBlockedByReverseDependency() {
     Fixture fixture;
     fixture.addQmd("base", "1.0.0", 10, true, {}, true);
@@ -463,6 +626,12 @@ int main() {
         {"direct cycle", directCycle},
         {"indirect cycle", indirectCycle},
         {"successful dependency", successfulDependency},
+        {"available roots are canonical", availableRootsAreCanonical},
+        {"entry may use safe relative subdirectory", entryMayUseSafeRelativeSubdirectory},
+        {"typed path matches full entry before basename", typedPathMatchesFullEntryBeforeBasename},
+        {"reinstall preserves runtime data home", reinstallPreservesRuntimeDataHome},
+        {"self disable is blocked", selfDisableBlocked},
+        {"self upgrade preserves previous package", selfUpgradePreservesPreviousPackage},
         {"reverse dependency blocks disable", disableBlockedByReverseDependency},
         {"reverse dependency blocks remove", removeBlockedByReverseDependency},
         {"desired-enabled consumer blocks dependency change", desiredEnabledConsumerBlocksDependencyChange},

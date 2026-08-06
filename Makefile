@@ -1,6 +1,6 @@
 objects = main.o inventory.o jsonutil.o xovi.o
 
-XOVI_REPO ?= ../../xovi
+XOVI_REPO ?= $(CURDIR)/xovi
 XOVIGEN ?= $(XOVI_REPO)/util/xovigen.py
 CXXFLAGS += -D_GNU_SOURCE -fPIC -std=c++17 -I.
 name = xovi-extension-manager

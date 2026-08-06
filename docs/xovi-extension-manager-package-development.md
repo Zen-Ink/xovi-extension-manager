@@ -19,32 +19,37 @@ Recommended package directory:
 example-extension/
   manifest.json
   example-extension.so
-  data/
+  assets/
 ```
 
 Recommended install location:
 
 ```text
-$XOVI_ROOT/exthome/<id>/
+$XOVI_ROOT/extensions.available/<id>/
 ```
 
 Enabled extension entry:
 
 ```text
 $XOVI_ROOT/extensions.d/<id>.so
-  -> $XOVI_ROOT/exthome/<id>/<entry>
+  -> $XOVI_ROOT/extensions.available/<id>/<entry>
 ```
 
 XOVI scans active extension entries under `$XOVI_ROOT/extensions.d/` when
-`xochitl` starts. The manager intentionally stores the real package under
-`$XOVI_ROOT/exthome/<id>/` and creates an active symlink only when the package
-is enabled. This separates installed state from active state:
+`xochitl` starts. The manager stores installed package contents under
+`$XOVI_ROOT/extensions.available/<id>/` and creates an active symlink only when
+the package is enabled. This separates installed state, active state, and
+runtime data:
 
-- `exthome/<id>/` can hold `manifest.json`, the `.so`, and package data without
-  making the plugin active.
+- `extensions.available/<id>/manifest.json` stores package metadata.
+- `extensions.available/<id>/` stores read-only program files and release
+  resources; `manifest.entry` points to the actual `.so` entry relative to this
+  directory.
 - `extensions.d/<id>.so` remains the small active entry that XOVI discovers.
+- `exthome/<id>/` is reserved for plugin-owned runtime data such as config,
+  cache, and user-created state.
 - Disable can remove only the managed symlink while leaving package files and
-  data intact.
+  runtime data intact.
 - Enable can detect active-entry conflicts instead of overwriting a manually
   installed `.so`.
 - Upgrade/remove operations can reason about package ownership from the
@@ -58,12 +63,11 @@ char *home = Environment->getExtensionDirectory("example-extension");
 ```
 
 In the current XOVI layout this resolves to the extension home directory for the
-given family, conventionally `$XOVI_EXTHOME/exthome/<family>`. Package authors
-should pass the same stable value used as the manager package `id`, and should
-store plugin-owned runtime data under that directory. The manager's
-`exthome/<id>/` package layout is therefore aligned with XOVI's own extension
-home API: the active `.so` is only the loader entry, while the package directory
-is the plugin's durable home.
+given family, conventionally `$XOVI_ROOT/exthome/<family>`. Package authors
+should pass the same stable value used as the manager package `id`, and must
+store plugin-owned runtime data under that directory. The manager does not treat
+`exthome/<id>/` as package payload, so reinstall, upgrade, and remove do not
+delete runtime data by default.
 
 `getExtensionDirectory()` does not read `manifest.json` and does not infer the
 manager package id. If a plugin passes a different family string, XOVI will
@@ -87,8 +91,9 @@ Development flow:
    ```
 
 3. Build the extension as a shared object with the reMarkable cross toolchain.
-4. Package `manifest.json`, the `.so` entry, and any runtime data under one
-   directory named after the manifest `id`.
+4. Package `manifest.json`, the `.so` entry named by `manifest.entry`, and any
+   read-only release resources under the package root. Do not ship mutable
+   runtime data in the package archive.
 
 ### XOVI Metadata and APIs
 
@@ -106,7 +111,7 @@ Common `.xovi` entries:
 | `export` | Exposes symbols to other XOVI modules. | Can be documented with package `provides`, but `provides` is informational. |
 | `override` | Declares functions the extension overrides in xochitl or another module. | No direct manager behavior; compatibility should be captured through `requires.xochitl` and `requires.architectures`. |
 | `condition` | Controls whether XOVI should load the extension in the current runtime. | The manager reports runtime load state, but does not evaluate arbitrary XOVI conditions itself. |
-| `resource` | Declares generated or embedded resources for the extension. | Package authors should ship required data inside `exthome/<id>/`. |
+| `resource` | Declares generated or embedded resources for the extension. | Package authors should ship read-only resources under the package root; mutable runtime data belongs under `exthome/<id>/`. |
 | `global-meta` | Carries extra metadata for tooling. | Can be used for manifest-only manager metadata such as softer dependency declarations. |
 
 For dependencies that should be enforced by the extension manager but must not
@@ -134,14 +139,14 @@ hide-dev-icon/
 Recommended canonical location:
 
 ```text
-$XOVI_ROOT/exthome/xovi-extension-manager/qmd/<id>/
+$XOVI_ROOT/qmd.available/<id>/
 ```
 
 Recommended active QMD link:
 
 ```text
 $XOVI_ROOT/exthome/qt-resource-rebuilder/<zero-padded-order>-<id>.qmd
-  -> ../xovi-extension-manager/qmd/<id>/<entry>
+  -> ../../qmd.available/<id>/<entry>
 ```
 
 QMD packages should declare:
@@ -246,7 +251,7 @@ Capability metadata such as `provides` describes what a package offers; it is no
 `<zero-padded-order>-<id>.qmd`. Lower `order` values load earlier; when two packages use the same `order`, the sorted filename makes `id` the practical tie-breaker. Same-order packages are reported as `qmd-order-conflict:<id>` so a caller can warn the user.
 
 The manager scans QMD packages from
-`$XOVI_ROOT/exthome/xovi-extension-manager/qmd/*/manifest.json`.
+`$XOVI_ROOT/qmd.available/*/manifest.json`.
 `enable` and `disable` manage the active QMD symlink under
 `$XOVI_ROOT/exthome/qt-resource-rebuilder/`.
 
@@ -262,7 +267,7 @@ The manager scans QMD packages from
 | `author` | string | Returned in package JSON. Empty when missing. |
 | `description` | string | Returned in package JSON. Empty when missing. |
 | `license` | string | Returned in package JSON. Empty when missing. |
-| `entry` | string | Relative filename inside the package directory. Must not be absolute, contain `/`, or contain `..`. Extension entries must end in `.so`; QMD entries must end in `.qmd`. Missing extension entries default to `<id>.so`; missing QMD entries are an error. |
+| `entry` | string | Safe relative path to the package entry file under the package root. It may be a flat filename such as `example-extension.so` or a subdirectory path such as `lib/example-extension.so`. It must not be absolute and must not contain empty path segments, `.`, or `..`. Extension entries must end in `.so`; QMD entries must end in `.qmd`. Missing extension entries default to `<id>.so`; missing QMD entries are an error. |
 | `enabled` | boolean | Desired enabled state. Defaults to `false` and adds `missing-enabled`. Current `enable` and `disable` calls rewrite this field directly in `manifest.json`. |
 | `order` | number | Parsed for QMD ordering, emitted in package JSON, and defaults to `50`. Valid QMD orders are `0` through `999`. |
 | `requires.xovi` | string | Compared with the compiled XOVI API version. Supported operators are `>=`, `>`, `=`, or exact semver. Missing values add `missing-requires.xovi`. |
@@ -270,7 +275,7 @@ The manager scans QMD packages from
 | `requires.qmd` | object of QMD package id to version requirement | Hard dependencies on managed QMD packages. Enable requires each dependency to be valid, version-compatible, effectively enabled, acyclic, and ordered before the consumer. |
 | `requires.xochitl` | string array | If non-empty and the current xochitl version is known, at least one entry must match. Entries without `*` match exactly; entries with `*` use simple wildcard matching, so `3.28.*` matches all `3.28` releases and `*` matches any known xochitl version. |
 | `requires.architectures` | string array | If non-empty and the current architecture is known, at least one entry must match. `aarch64` and `arm64` are treated as aliases. |
-| Other keys | any | Ignored by the current manager unless future code adds support. `xovigen.py` may emit `homepage` and `source`, but they are not returned by the current broker responses. |
+| Other keys | any | Ignored by the current manager unless future code adds support. `xovigen.py` may emit `homepage` and `source`, but they are not returned by the current broker responses. Legacy top-level fields such as `xoviApi`, `dependencies`, `xochitlVersions`, and top-level `architectures` are ignored; use the `requires` object instead. |
 
 Dependency and compatibility failures are reported through each package's `issues` array. `enable` rejects packages with blocking issues such as invalid manifest, missing entry, incompatible XOVI/xochitl/architecture, active symlink conflict, missing dependency, disabled dependency, or incompatible dependency
 version.

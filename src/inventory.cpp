@@ -142,23 +142,48 @@ namespace {
         return PACKAGE_UNKNOWN;
     }
 
+    bool validRelativeEntry(const std::string &entry) {
+        if(entry.empty() || entry[0] == '/') return false;
+        size_t start = 0;
+        while(start <= entry.size()) {
+            size_t slash = entry.find('/', start);
+            std::string part = entry.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+            if(part.empty() || part == "." || part == "..") return false;
+            if(slash == std::string::npos) break;
+            start = slash + 1;
+        }
+        return true;
+    }
+
     bool validEntryForType(const std::string &entry, PackageType type) {
-        bool validRelativeFile = !entry.empty() &&
-            entry[0] != '/' &&
-            entry.find('/') == std::string::npos &&
-            entry.find("..") == std::string::npos;
-        if(!validRelativeFile) return false;
+        if(!validRelativeEntry(entry)) return false;
         if(type == PACKAGE_EXTENSION) return hasSuffix(entry, ".so");
         if(type == PACKAGE_QMD) return hasSuffix(entry, ".qmd");
         return false;
     }
 
+    std::string extensionPackageRoot() {
+        return joinPath(xoviRoot(), "extensions.available");
+    }
+
     std::string qmdPackageRoot() {
-        return joinPath(joinPath(xoviRoot(), "exthome"), "xovi-extension-manager/qmd");
+        return joinPath(xoviRoot(), "qmd.available");
     }
 
     std::string qmdActiveDir() {
         return joinPath(joinPath(xoviRoot(), "exthome"), "qt-resource-rebuilder");
+    }
+
+    std::string persistentDataDir(const ExtensionManifest &manifest) {
+        return joinPath(joinPath(xoviRoot(), "exthome"), manifest.id);
+    }
+
+    std::string managerStateRoot() {
+        return joinPath(joinPath(joinPath(xoviRoot(), "exthome"), "xovi-extension-manager"), "state");
+    }
+
+    std::string previousSelfPackageDir() {
+        return joinPath(joinPath(managerStateRoot(), "previous"), "xovi-extension-manager");
     }
 
     std::string qmdActiveFileName(const ExtensionManifest &manifest) {
@@ -405,6 +430,80 @@ namespace {
         removeTree(path, ignored);
     }
 
+    bool renamePath(const std::string &from, const std::string &to, std::string &error) {
+        if(rename(from.c_str(), to.c_str()) == 0) return true;
+        error = std::strerror(errno);
+        return false;
+    }
+
+    bool replacePackageDirectory(
+        const std::string &sourceDir,
+        const std::string &targetDir,
+        bool preservePrevious,
+        std::vector<std::string> &actions,
+        std::string &error
+    ) {
+        std::string parent = parentPath(targetDir);
+        if(!mkdirRecursive(parent)) {
+            error = "cannot create package root";
+            return false;
+        }
+
+        size_t slash = targetDir.find_last_of('/');
+        std::string name = slash == std::string::npos ? targetDir : targetDir.substr(slash + 1);
+        std::string staging = joinPath(parent, ".xovi-install-staged-" + name);
+        std::string backup = joinPath(parent, ".xovi-install-backup-" + name);
+        removeTree(staging, error);
+        removeTree(backup, error);
+        error.clear();
+
+        if(!copyDirectory(sourceDir, staging, error)) {
+            removeTree(staging, error);
+            return false;
+        }
+
+        bool hadTarget = isPathPresent(targetDir);
+        if(hadTarget && !renamePath(targetDir, backup, error)) {
+            removeTree(staging, error);
+            return false;
+        }
+
+        if(!renamePath(staging, targetDir, error)) {
+            std::string rollbackError;
+            removeTree(targetDir, rollbackError);
+            if(hadTarget) renamePath(backup, targetDir, rollbackError);
+            return false;
+        }
+
+        actions.push_back(hadTarget ? "package-directory-replaced" : "package-directory-created");
+
+        if(hadTarget) {
+            if(preservePrevious) {
+                std::string previous = previousSelfPackageDir();
+                std::string previousParent = parentPath(previous);
+                if(!mkdirRecursive(previousParent)) {
+                    actions.push_back("previous-self-package-preserve-failed");
+                    removeTree(backup, error);
+                    error.clear();
+                } else {
+                    removeTree(previous, error);
+                    error.clear();
+                    if(renamePath(backup, previous, error)) {
+                        actions.push_back("previous-self-package-preserved");
+                    } else {
+                        actions.push_back("previous-self-package-preserve-failed");
+                        removeTree(backup, error);
+                        error.clear();
+                    }
+                }
+            } else {
+                if(!removeTree(backup, error)) return false;
+            }
+        }
+
+        return true;
+    }
+
     bool extractArchive(const std::string &archivePath, const std::string &targetDir, std::string &error) {
         if(hasSuffix(archivePath, ".tar.gz") || hasSuffix(archivePath, ".tgz")) {
             return runCommandNoXovi({"tar", "-xzf", archivePath, "-C", targetDir}, error);
@@ -641,10 +740,6 @@ namespace {
         std::string requires = jsonutil::readObject(json, "requires");
         if(requires.empty()) {
             manifest.warnings.push_back("missing-requires");
-            manifest.requiresXovi = jsonutil::readString(json, "xoviApi", "");
-            manifest.requiresExtensions = jsonutil::readStringObject(json, "dependencies");
-            manifest.requiresXochitl = jsonutil::readStringArray(json, "xochitlVersions");
-            manifest.requiresArchitectures = jsonutil::readStringArray(json, "architectures");
         } else {
             manifest.requiresXovi = jsonutil::readString(requires, "xovi", "");
             manifest.requiresExtensions = jsonutil::readStringObject(requires, "extensions");
@@ -666,7 +761,7 @@ namespace {
         manifest.type = PACKAGE_EXTENSION;
         manifest.typeName = packageTypeName(manifest.type);
         manifest.directoryName = id;
-        manifest.directoryPath = joinPath(joinPath(xoviRoot(), "exthome"), id);
+        manifest.directoryPath = joinPath(extensionPackageRoot(), id);
         manifest.id = id;
         manifest.name = id;
         manifest.entry = id + ".so";
@@ -967,8 +1062,12 @@ namespace {
         std::vector<std::string> actions;
         actions.push_back("inspect");
         if(manifest.managed && manifest.hasManifest) {
+            if(manifest.id == "xovi-extension-manager") {
+                if(!manifest.enabled) actions.push_back("enable");
+                return actions;
+            }
             actions.push_back(manifest.enabled ? "disable" : "enable");
-            if(manifest.id != "xovi-extension-manager") actions.push_back("remove");
+            actions.push_back("remove");
             return actions;
         }
         if(manifest.source == "legacy") {
@@ -1125,7 +1224,7 @@ namespace {
 
     std::string targetDirForPackage(PackageType type, const std::string &id) {
         if(type == PACKAGE_QMD) return joinPath(qmdPackageRoot(), id);
-        return joinPath(joinPath(xoviRoot(), "exthome"), id);
+        return joinPath(extensionPackageRoot(), id);
     }
 
     std::string sidecarManifestPath(const std::string &path) {
@@ -1239,7 +1338,15 @@ namespace {
                 if(extension.type != request.type) continue;
                 if((!request.id.empty() && (extension.id == request.id || extension.directoryName == request.id)) ||
                     (!request.path.empty() && (enabledEntryPath(extension) == request.path || sourceEntryPath(extension) == request.path ||
-                        fileName(enabledEntryPath(extension)) == fileName(request.path) || fileName(sourceEntryPath(extension)) == fileName(request.path)))) {
+                        extension.entry == request.path))) {
+                    return static_cast<int>(i);
+                }
+            }
+            for(size_t i = 0; i < inventory.extensions.size(); ++i) {
+                const ExtensionManifest &extension = inventory.extensions[i];
+                if(extension.type != request.type || request.path.empty()) continue;
+                if(fileName(enabledEntryPath(extension)) == fileName(request.path) ||
+                    fileName(sourceEntryPath(extension)) == fileName(request.path)) {
                     return static_cast<int>(i);
                 }
             }
@@ -1293,7 +1400,7 @@ namespace {
     bool isLegacyDirectoryPath(PackageType type, const std::string &path) {
         if(path.empty() || !isDirectory(path) || isPathPresent(joinPath(path, "manifest.json"))) return false;
         if(type == PACKAGE_QMD) return parentPath(path) == qmdPackageRoot();
-        if(type == PACKAGE_EXTENSION) return parentPath(path) == joinPath(xoviRoot(), "exthome");
+        if(type == PACKAGE_EXTENSION) return parentPath(path) == extensionPackageRoot();
         return false;
     }
 
@@ -1651,6 +1758,10 @@ namespace {
 
         InstallPlan plan;
         std::vector<std::string> actions;
+        if(isSelfPackage(manifest) && !desiredEnabled) {
+            desiredEnabled = true;
+            actions.push_back("self-package-forced-enabled");
+        }
         std::string conflictError;
         if(!classifyInstallMode(manifest, desiredEnabled, plan, actions, conflictError)) return conflictError;
 
@@ -1658,12 +1769,33 @@ namespace {
         if(!replaceEnabledValue(manifestJson, false, error)) return errorJson("invalid-manifest", error);
 
         std::string targetDir = targetDirForPackage(manifest.type, manifest.id);
-        if(!mkdirRecursive(targetDir)) return errorJson("mkdir-failed", "target directory could not be created");
+        char tempTemplate[] = "/tmp/xovi-extmgr-single-XXXXXX";
+        char *tempDirRaw = mkdtemp(tempTemplate);
+        if(tempDirRaw == nullptr) return errorJson("tempdir-failed", std::strerror(errno));
+        std::string tempDir = tempDirRaw;
 
-        if(!copyFile(request.path, joinPath(targetDir, manifest.entry), error)) return errorJson("copy-failed", error);
+        std::string tempEntry = joinPath(tempDir, manifest.entry);
+        if(!mkdirRecursive(parentPath(tempEntry))) {
+            cleanupTempDir(tempDir);
+            return errorJson("mkdir-failed", "temporary package directory could not be created");
+        }
+
+        if(!copyFile(request.path, tempEntry, error)) {
+            cleanupTempDir(tempDir);
+            return errorJson("copy-failed", error);
+        }
         actions.push_back("entry-copied");
-        if(!writeFile(joinPath(targetDir, "manifest.json"), manifestJson, error)) return errorJson("write-failed", error);
+        if(!writeFile(joinPath(tempDir, "manifest.json"), manifestJson, error)) {
+            cleanupTempDir(tempDir);
+            return errorJson("write-failed", error);
+        }
         actions.push_back(manifestPath.empty() ? "minimal-manifest-created" : "sidecar-manifest-copied");
+
+        if(!replacePackageDirectory(tempDir, targetDir, isSelfPackage(manifest), actions, error)) {
+            cleanupTempDir(tempDir);
+            return errorJson("copy-failed", error);
+        }
+        cleanupTempDir(tempDir);
 
         manifest.directoryPath = targetDir;
         manifest.manifestPath = joinPath(targetDir, "manifest.json");
@@ -1704,20 +1836,17 @@ namespace {
         std::string targetDir = targetDirForPackage(manifest.type, manifest.id);
         InstallPlan plan;
         std::vector<std::string> actions;
+        if(isSelfPackage(manifest) && !desiredEnabled) {
+            desiredEnabled = true;
+            actions.push_back("self-package-forced-enabled");
+        }
         std::string conflictError;
         if(!classifyInstallMode(manifest, desiredEnabled, plan, actions, conflictError)) {
             cleanupTempDir(tempDir);
             return conflictError;
         }
 
-        if(!copyDirectory(packageDir, targetDir, error)) {
-            cleanupTempDir(tempDir);
-            return errorJson("copy-failed", error);
-        }
-        actions.push_back("archive-extracted");
-        actions.push_back("package-files-copied");
-
-        std::string targetManifest = joinPath(targetDir, "manifest.json");
+        std::string targetManifest = joinPath(packageDir, "manifest.json");
         std::string json = readFile(targetManifest);
         if(!replaceEnabledValue(json, false, error)) {
             cleanupTempDir(tempDir);
@@ -1727,6 +1856,13 @@ namespace {
             cleanupTempDir(tempDir);
             return errorJson("write-failed", error);
         }
+
+        if(!replacePackageDirectory(packageDir, targetDir, isSelfPackage(manifest), actions, error)) {
+            cleanupTempDir(tempDir);
+            return errorJson("copy-failed", error);
+        }
+        actions.push_back("archive-extracted");
+        actions.push_back("package-files-copied");
 
         cleanupTempDir(tempDir);
         manifest.directoryPath = targetDir;
@@ -1767,13 +1903,14 @@ Inventory loadInventory(bool includeRuntime) {
     inventory.architecture = currentArchitecture();
     inventory.xochitlVersion = currentXochitlVersion();
 
-    std::string exthome = joinPath(inventory.root, "exthome");
-    DIR *root = opendir(exthome.c_str());
+    std::string extensionRoot = extensionPackageRoot();
+    DIR *root = opendir(extensionRoot.c_str());
     if(root != nullptr) {
         struct dirent *entry;
         while((entry = readdir(root)) != nullptr) {
             if(std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
-            std::string extensionDir = joinPath(exthome, entry->d_name);
+            if(entry->d_name[0] == '.') continue;
+            std::string extensionDir = joinPath(extensionRoot, entry->d_name);
             if(!isDirectory(extensionDir)) continue;
 
             std::string manifestPath = joinPath(extensionDir, "manifest.json");
@@ -1792,6 +1929,7 @@ Inventory loadInventory(bool includeRuntime) {
         struct dirent *entry;
         while((entry = readdir(qmdDir)) != nullptr) {
             if(std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
+            if(entry->d_name[0] == '.') continue;
             std::string packageDir = joinPath(qmdRoot, entry->d_name);
             if(!isDirectory(packageDir)) continue;
 
@@ -1887,6 +2025,8 @@ std::string extensionToJson(const Inventory &inventory, const ExtensionManifest 
     addBoolField(out, first, "hasManifest", extension.hasManifest);
     addBoolField(out, first, "valid", extension.valid);
     addStringField(out, first, "directoryPath", extension.directoryPath);
+    addStringField(out, first, "packagePath", extension.directoryPath);
+    addStringField(out, first, "dataPath", persistentDataDir(extension));
     addStringField(out, first, "manifestPath", extension.manifestPath);
     addComma(out, first);
     out << "\"requires\":{"
@@ -1958,8 +2098,13 @@ int findExtension(const Inventory &inventory, const std::string &id) {
             extension.directoryName == wanted ||
             extension.entry == wanted ||
             enabledEntryPath(extension) == wanted ||
-            sourceEntryPath(extension) == wanted ||
-            fileName(enabledEntryPath(extension)) == wanted ||
+            sourceEntryPath(extension) == wanted) {
+            return static_cast<int>(i);
+        }
+    }
+    for(size_t i = 0; i < inventory.extensions.size(); ++i) {
+        const ExtensionManifest &extension = inventory.extensions[i];
+        if(fileName(enabledEntryPath(extension)) == wanted ||
             fileName(sourceEntryPath(extension)) == wanted) {
             return static_cast<int>(i);
         }
@@ -1979,6 +2124,9 @@ std::string setExtensionEnabled(const std::string &id, bool enabled) {
     ExtensionManifest &extension = inventory.extensions[static_cast<size_t>(index)];
     if(!extension.hasManifest || extension.manifestPath.empty()) {
         return errorJson("missing-manifest", "package has no manifest.json");
+    }
+    if(!enabled && isSelfPackage(extension)) {
+        return errorJson("self-disable-blocked", "xovi-extension-manager cannot disable itself");
     }
     if(!enabled && extension.type == PACKAGE_QMD) {
         std::vector<std::string> issues = qmdRequiredByIssues(inventory, extension);
@@ -2121,6 +2269,7 @@ std::string adoptLegacyPackage(const std::string &request) {
     std::string name = parsed.name.empty() ? (hasProvidedManifest ? provided.name : legacy.name) : parsed.name;
     std::string version = parsed.version.empty() ? (hasProvidedManifest ? provided.version : "unknown") : parsed.version;
     bool desiredEnabled = parsed.enabledProvided ? parsed.enabled : effectiveEnabled(legacy);
+    if(id == "xovi-extension-manager") desiredEnabled = true;
 
     if(hasProvidedManifest) {
         if(provided.id != id) return errorJson("manifest-id-mismatch", "provided manifest id does not match requested id");
@@ -2138,7 +2287,7 @@ std::string adoptLegacyPackage(const std::string &request) {
     std::string targetDir = targetDirForPackage(type, id);
     std::string targetManifest = joinPath(targetDir, "manifest.json");
     if(isPathPresent(targetManifest)) return errorJson("installed-conflict", "target manifest already exists");
-    if(!mkdirRecursive(targetDir)) return errorJson("mkdir-failed", "target directory could not be created");
+    if(!mkdirRecursive(targetDir)) return errorJson("mkdir-failed", "target package directory could not be created");
 
     if(!hasProvidedManifest) {
         manifestJson = minimalManifestJson(type, id, entry, false, order, name, version);
@@ -2148,6 +2297,7 @@ std::string adoptLegacyPackage(const std::string &request) {
     if(!replaceEnabledValue(manifestJson, false, error)) return errorJson("invalid-manifest", error);
 
     std::string targetEntry = joinPath(targetDir, entry);
+    if(!mkdirRecursive(parentPath(targetEntry))) return errorJson("mkdir-failed", "target entry directory could not be created");
     std::vector<std::string> actions;
     if(isPathPresent(targetEntry) && !pathsReferToSameFile(source, targetEntry)) {
         return errorJson("entry-conflict", "target entry already exists and is not the legacy source");
@@ -2436,8 +2586,16 @@ std::string schemaJson() {
     return "{"
         "\"ok\":true,"
         "\"manifestFiles\":{"
-            "\"extension\":\"/home/root/xovi/exthome/<id>/manifest.json\","
-            "\"qmd\":\"/home/root/xovi/exthome/xovi-extension-manager/qmd/<id>/manifest.json\""
+            "\"extension\":\"/home/root/xovi/extensions.available/<id>/manifest.json\","
+            "\"qmd\":\"/home/root/xovi/qmd.available/<id>/manifest.json\""
+        "},"
+        "\"packageFiles\":{"
+            "\"extension\":\"/home/root/xovi/extensions.available/<id>/<entry>\","
+            "\"qmd\":\"/home/root/xovi/qmd.available/<id>/<entry>\""
+        "},"
+        "\"dataDirectories\":{"
+            "\"extension\":\"/home/root/xovi/exthome/<id>\","
+            "\"qmd\":\"/home/root/xovi/exthome/<id>\""
         "},"
         "\"installSupports\":[\".so\",\".qmd\",\".tar.gz\",\".tgz\",\".zip\"],"
         "\"legacySupports\":[\"active .so in extensions.d\",\"active .qmd in exthome/qt-resource-rebuilder\"],"
@@ -2453,7 +2611,7 @@ std::string schemaJson() {
             "\"type\":\"inferred from entry suffix\","
             "\"name\":\"<id>\","
             "\"version\":\"unknown\","
-            "\"entry\":\"<id>.so for extension; hard error for qmd\","
+            "\"entry\":\"safe relative path under package root; defaults to <id>.so for extension; hard error for qmd\","
             "\"order\":50,"
             "\"enabled\":false,"
             "\"requires\":{}"

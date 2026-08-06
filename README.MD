@@ -8,33 +8,47 @@ current-process load state. It does not load plugin `.so` files to inspect metad
 Please note that the manager requires the modified XOVI runtime API `>=0.3.0`,
 and asivery's `xovi-message-broker` to support API calling.
 
+The required XOVI source is tracked as a git submodule under `xovi/`.
+Initialize it after cloning:
+
+```sh
+git submodule update --init --recursive
+```
+
 ## Managed Layout
 
-Native extensions are stored under `exthome/<id>/` and enabled through a symlink in `extensions.d/`:
+Native extension packages are stored under `extensions.available/<id>/` and
+enabled through a symlink in `extensions.d/`:
 
 ```text
-/home/root/xovi/exthome/<id>/
+/home/root/xovi/extensions.available/<id>/
   manifest.json
   <entry>.so
 
 /home/root/xovi/extensions.d/<id>.so
-  -> ../exthome/<id>/<entry>.so
+  -> ../extensions.available/<id>/<entry>.so
 ```
 
-Standalone QMD packages are stored under the manager's QMD package directory
-and enabled through `qt-resource-rebuilder`'s active directory:
+Standalone QMD packages are stored under `qmd.available/<id>/` and enabled
+through `qt-resource-rebuilder`'s active directory:
 
 ```text
-/home/root/xovi/exthome/xovi-extension-manager/qmd/<id>/
+/home/root/xovi/qmd.available/<id>/
   manifest.json
   <entry>.qmd
 
 /home/root/xovi/exthome/qt-resource-rebuilder/<zero-padded-order>-<id>.qmd
-  -> ../xovi-extension-manager/qmd/<id>/<entry>.qmd
+  -> ../../qmd.available/<id>/<entry>.qmd
 ```
 
-`exthome/<id>/` remains the native plugin's own XOVI extension home. The manager
-only owns `exthome/xovi-extension-manager/`.
+`manifest.entry` is the entry file path relative to the package directory. It
+may be a flat filename or a safe relative path with subdirectories; absolute
+paths, empty path segments, `.`, and `..` are invalid.
+
+`exthome/<id>/` is reserved for plugin runtime data such as config, cache, and
+user-created state. Reinstall, upgrade, and remove operate on `*.available`
+package directories and do not delete `exthome/<id>` unless a future explicit
+purge operation is added.
 
 ## Broker API
 
