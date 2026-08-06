@@ -1,0 +1,5 @@
+manifest.json
+*.so
+*.o
+rcc/
+.history/

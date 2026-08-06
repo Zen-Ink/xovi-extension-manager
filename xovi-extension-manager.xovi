@@ -1,0 +1,81 @@
+version 0.1.0
+
+condition getScannedExtensionCount
+
+global-meta
+    id = "xovi-extension-manager"
+    name = "XOVI Extension Manager"
+    author = "lurenmax"
+    description = "Manifest-based package inventory, install, and enable/disable control for XOVI and QMD packages"
+    license = "MIT"
+    requiresXovi = ">=0.3.0"
+    requiresExtensions = "xovi-message-broker:>=0.2.0"
+    architectures = "aarch64,arm"
+    entry = "xovi-extension-manager.so"
+end
+
+export xovi_extension_manager_list
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$list"
+end
+
+export xovi_extension_manager_get
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$get"
+end
+
+export xovi_extension_manager_enable
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$enable"
+end
+
+export xovi_extension_manager_disable
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$disable"
+end
+
+export xovi_extension_manager_install
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$install"
+end
+
+export xovi_extension_manager_adopt
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$adopt"
+end
+
+export xovi_extension_manager_disable_legacy
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$disableLegacy"
+end
+
+export xovi_extension_manager_remove
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$remove"
+end
+
+export xovi_extension_manager_requires_restart
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$requiresRestart"
+end
+
+export xovi_extension_manager_schema
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$schema"
+end
+
+export xovi_extension_manager_health
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$health"
+end
