@@ -1,4 +1,5 @@
 #include "inventory.h"
+#include "diagnostics.h"
 #include "jsonutil.h"
 #include <algorithm>
 #include "xovi.h"
@@ -882,6 +883,56 @@ void runtimeAndWarningDiagnostics() {
     requireNotContains(output,"missing-runtime-dependency");
 }
 
+void failedRuntimeIsNotARestartFix() {
+    Fixture f;
+    f.addExtension("bad-elf", "1.0.0", true, true);
+    auto inventory=loadInventory(false);
+    auto &package=inventory.extensions[findExtension(inventory,"bad-elf")];
+    for(int state:{XOVI_EXTENSION_DLOPEN_FAILED,XOVI_EXTENSION_SHOULDLOAD_FAILED,XOVI_EXTENSION_CONDITION_FAILED,XOVI_EXTENSION_DEPENDENCY_FAILED,XOVI_EXTENSION_LINK_FAILED}) {
+        package.runtime.loadState=state;
+        package.runtime.loadError="/lib/dependency.so: wrong ELF class: ELFCLASS32";
+        const auto json=extensionToJson(inventory,package);
+        requireContains(json,"\"requiresRestart\":false");
+        requireContains(json,"\"restartToApply\":false");
+        requireContains(json,"\"diagnostics\":[");
+        if(state==XOVI_EXTENSION_DLOPEN_FAILED) {
+            requireContains(json,"elf-class-mismatch");
+            requireContains(json,"\"severity\":\"error\"");
+            requireContains(json,"\"action\":\"replace-build\"");
+            requireContains(json,"/lib/dependency.so");
+        }
+    }
+    package.runtime.loadState=XOVI_EXTENSION_INITIALIZED;
+    requireContains(extensionToJson(inventory,package),"\"requiresRestart\":false");
+    // A real saved change remains restartable; the error is still reported independently.
+    const auto disabled=setExtensionEnabled("bad-elf",false);
+    requireContains(disabled,"\"ok\":true");
+    const auto enabled=setExtensionEnabled("bad-elf",true);
+    requireContains(enabled,"\"ok\":true");
+    inventory=loadInventory(false);
+    auto changed=inventory.extensions[findExtension(inventory,"bad-elf")];
+    changed.runtime.loadState=XOVI_EXTENSION_DLOPEN_FAILED;
+    changed.runtime.loadError="wrong ELF class";
+    const auto output=extensionToJson(inventory,changed);
+    requireContains(output,"\"pendingChange\":true");
+    requireContains(output,"\"requiresRestart\":true");
+    requireContains(output,"elf-class-mismatch");
+}
+void diagnosticRecoveryIsSpecific() {
+    require(xem::classify("missing-manifest","","warning").severity=="warning","inventory metadata is warning");
+    require(xem::classify("missing-manifest").severity=="error","manifest-required operation is error");
+    require(xem::classify("runtime-dlopen-failed","undefined symbol: qt_symbol").causeCode=="abi-mismatch","symbol failure classified");
+    require(xem::classify("runtime-dlopen-failed","libfoo.so: No such file").causeCode=="loader-file-missing","missing library classified");
+    require(xem::classify("runtime-dlopen-failed","Permission denied").causeCode=="loader-permission-denied","permissions classified");
+    require(xem::classify("runtime-dlopen-failed","file too short").causeCode=="invalid-elf","corrupt binary classified");
+    require(xem::classify("revision-conflict").retryable,"revision conflict is retryable after refresh");
+    require(xem::classify("shadowed-by-qrr").severity=="warning","resource override is not automatically fatal");
+    require(xem::classify("target-not-seen").severity=="info","unseen lazy resource is informational");
+    require(xem::classify("unknown-new-code").action=="inspect","unknown cause never recommends reboot");
+    require(xem::classify("unknown-new-failed").category=="unknown","unknown failure is not guessed to be a filesystem error");
+    requireContains(errorJson("write-failed","read-only filesystem"),"\"diagnostic\":{");
+}
+
 void schemaAdvertisesQmdDependencies() {
     std::string schema = schemaJson();
     requireContains(schema, "\"qmd\":{\"scroll-screen-up-or-down\":\">=0.1.2\"}");
@@ -893,6 +944,8 @@ void schemaAdvertisesQmdDependencies() {
 
 int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"runtime failure is not a restart fix", failedRuntimeIsNotARestartFix},
+        {"specific diagnostic recovery", diagnosticRecoveryIsSpecific},
         {"runtime aliases, implicit dependencies and warning severity",runtimeAndWarningDiagnostics},
         {"requires.qmd parse and JSON", parseAndJsonRoundTrip},
         {"missing dependency", missingDependency},

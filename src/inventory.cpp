@@ -1,3 +1,4 @@
+#include "diagnostics.h"
 #include "inventory.h"
 
 #include "jsonutil.h"
@@ -1235,7 +1236,9 @@ namespace {
         if(manifest.type == PACKAGE_QML || manifest.source == "runtime") return PENDING_RESTART_PACKAGES.count(manifest.id) != 0;
         bool active = effectiveEnabled(manifest);
         if(PENDING_RESTART_PACKAGES.find(manifest.id) != PENDING_RESTART_PACKAGES.end()) return true;
-        if(manifest.type == PACKAGE_QMD) return manifest.enabled != active;
+        if(manifest.type == PACKAGE_QMD) return false; // Entry mismatch needs repair, not a restart.
+        if(manifest.runtime.loadState >= XOVI_EXTENSION_DLOPEN_FAILED &&
+           manifest.runtime.loadState <= XOVI_EXTENSION_LINK_FAILED) return false;
         if(manifest.runtime.loadState == XOVI_EXTENSION_INITIALIZED && !active) return true;
         if(manifest.runtime.loadState != XOVI_EXTENSION_INITIALIZED && active) return true;
         return false;
@@ -2296,6 +2299,35 @@ std::string extensionToJson(const Inventory &inventory, const ExtensionManifest 
         << "\"version\":\"" << jsonutil::escape(extension.runtime.version) << "\""
         << "}";
     addBoolField(out, first, "requiresRestart", requiresRestart(extension));
+    addBoolField(out, first, "pendingChange", PENDING_RESTART_PACKAGES.count(extension.id) != 0);
+    addBoolField(out, first, "restartToApply", requiresRestart(extension));
+    addComma(out, first);
+    out << "\"diagnostics\":[";
+    bool firstDiagnostic = true;
+    for(const auto &code : computeIssues(inventory, extension)) {
+        if(!firstDiagnostic) out << ",";
+        firstDiagnostic=false;
+        auto diagnostic=xem::classify(code, code.find("runtime-")==0 ? extension.runtime.loadError : "", "inventory");
+        if(code.find("runtime-dependency-failed:")==0) {
+            const auto id=code.substr(std::string("runtime-dependency-failed:").size());
+            int dependency=findExtension(inventory,id);
+            if(dependency<0) dependency=findExtension(inventory,id+".so");
+            if(dependency>=0) {
+                const auto &runtime=inventory.extensions[dependency].runtime;
+                diagnostic.detail=runtime.loadError;
+                if(runtime.loadState==XOVI_EXTENSION_DLOPEN_FAILED)
+                    diagnostic.causeCode=xem::classify("runtime-dlopen-failed",runtime.loadError).causeCode;
+            }
+        }
+        out << xem::diagnosticJson(diagnostic);
+    }
+    for(const auto &code : computeWarnings(inventory, extension)) {
+        if(!firstDiagnostic) out << ",";
+        firstDiagnostic=false;
+        out << xem::diagnosticJson(xem::classify(code, "", "warning"));
+    }
+    out << "]";
+
     addComma(out, first);
     out << "\"warnings\":" << jsonutil::stringArray(computeWarnings(inventory, extension));
     addComma(out, first);
@@ -2364,7 +2396,7 @@ int findExtension(const Inventory &inventory, const std::string &id) {
 }
 
 std::string errorJson(const std::string &code, const std::string &message) {
-    return "{\"ok\":false,\"error\":\"" + jsonutil::escape(code) + "\",\"message\":\"" + jsonutil::escape(message) + "\"}";
+    return "{\"ok\":false,\"error\":\"" + jsonutil::escape(code) + "\",\"message\":\"" + jsonutil::escape(message) + "\",\"diagnostic\":" + xem::diagnosticJson(xem::classify(code, message)) + "}";
 }
 
 bool isSettingsProviderSuppressed(const std::string &runtimeName) {
@@ -2896,40 +2928,25 @@ std::string reconcileDisabledEntries() {
 }
 
 void scanDependenciesAtStartup() {
-    Inventory inventory = loadInventory();
-    int blockingCount = 0;
-    int warningCount = 0;
-    for(const ExtensionManifest &extension : inventory.extensions) {
-        std::vector<std::string> issues = computeIssues(inventory, extension);
-        const auto warnings=computeWarnings(inventory,extension);
-        if(issues.empty() && warnings.empty()) continue;
-
-        bool blocking = extension.enabled && hasBlockingEnableIssue(issues);
-        bool qmdOrderWarning = false;
-        for(const std::string &issue : warnings) {
-            if(issue.rfind("qmd-order-conflict:", 0) == 0) qmdOrderWarning = true;
-        }
-        if(!blocking && !qmdOrderWarning) continue;
-
-        if(blocking) ++blockingCount;
-        if(qmdOrderWarning) ++warningCount;
-        std::fprintf(
-            stderr,
-            "[xovi-extension-manager] startup dependency scan: %s package %s has %s %s\n",
-            blocking ? "enabled" : "qmd",
-            extension.id.c_str(),
-            blocking ? "errors" : "warnings",
-            jsonutil::stringArray(blocking ? issues : warnings).c_str()
-        );
+    const Inventory inventory = loadInventory();
+    int blockingCount=0, errorCount=0, warningCount=0;
+    for(const auto &extension:inventory.extensions) {
+        const auto issues=computeIssues(inventory,extension);
+        if(extension.enabled && hasBlockingEnableIssue(issues)) ++blockingCount;
+        auto report=[&](const std::string &code,const std::string &context) {
+            const auto diagnostic=xem::classify(code,code.find("runtime-")==0 ? extension.runtime.loadError : "",context);
+            if(diagnostic.severity=="error") ++errorCount;
+            else if(diagnostic.severity=="warning") ++warningCount;
+            else return;
+            std::fprintf(stderr,"[xovi-extension-manager] startup diagnostic owner=%s %s\n",
+                         extension.id.c_str(),xem::diagnosticJson(diagnostic).c_str());
+        };
+        for(const auto &code:issues) report(code,"inventory");
+        for(const auto &code:computeWarnings(inventory,extension)) report(code,"warning");
     }
-    if(blockingCount > 0 || warningCount > 0) {
-        std::fprintf(
-            stderr,
-            "[xovi-extension-manager] startup dependency scan complete: blocking=%d warnings=%d\n",
-            blockingCount,
-            warningCount
-        );
-    }
+    if(blockingCount || errorCount || warningCount)
+        std::fprintf(stderr,"[xovi-extension-manager] startup diagnostic scan complete: blockingPackages=%d errors=%d warnings=%d\n",
+                     blockingCount,errorCount,warningCount);
 }
 
 std::string schemaJson() {

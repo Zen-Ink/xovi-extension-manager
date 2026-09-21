@@ -1,3 +1,4 @@
+#include "diagnostics_qt.h"
 #include "notifications.h"
 #include "../sdk/xovi-notifications.h"
 
@@ -29,7 +30,7 @@ quint64 revision = 0;
 quint64 nextToastRevision = 1;
 quint64 nextActionSequence = 1;
 
-QJsonObject failure(const char *code) { return {{"ok", false}, {"error", code}}; }
+QJsonObject failure(const char *code) { return withDiagnostic({{"ok", false}, {"error", code}}); }
 bool validId(const QString &value) {
     return QRegularExpression("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$").match(value).hasMatch();
 }

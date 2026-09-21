@@ -119,3 +119,5 @@ The `xovi` submodule supplies the binding generator; `XOVI_REPO` can override it
 Standalone build: `TOOLCHAIN_ROOT=/path/to/toolchian ./build.sh all`.
 The toolchain root contains the `rmpp` and `rm2` SDK environment scripts;
 libraries and manifests are copied to `build/<arch>/`.
+
+Diagnostics: [error levels, recovery and restart semantics](docs/diagnostics.md).

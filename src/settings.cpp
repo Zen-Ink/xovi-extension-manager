@@ -1,3 +1,4 @@
+#include "diagnostics_qt.h"
 #include "settings.h"
 #include "inventory.h"
 #include "../xovi.h"
@@ -22,7 +23,7 @@ std::mutex mutex;
 QJsonObject uiStates;
 QMap<QString,QJsonObject> runtimePages;
 const QString session = QUuid::createUuid().toString(QUuid::WithoutBraces);
-QJsonObject failure(const QString &code) { return {{"ok", false}, {"error", code}}; }
+QJsonObject failure(const QString &code) { return withDiagnostic({{"ok", false}, {"error", code}}); }
 bool validId(const QString &id) {
     return QRegularExpression("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$").match(id).hasMatch();
 }
@@ -338,7 +339,15 @@ QJsonObject run(const std::string &cmd,const QJsonObject &req) {
         char *s=api->snapshot();
         if(!s) return failure("snapshot-unavailable");
         auto doc=QJsonDocument::fromJson(s); api->freeString(s);
+        if(!doc.isObject() || !doc.object().value("ok").toBool()) return failure("snapshot-unavailable");
         auto out=doc.object();
+        QJsonArray results;
+        for(const auto &value:out.value("results").toArray()) {
+            auto row=value.toObject();
+            row.insert("diagnostic",diagnosticObject(row.value("code").toString(),row.value("message").toString(),"injection"));
+            results.append(row);
+        }
+        out.insert("results",results);
         bool ok; auto policy=readObject(root()+"/exthome/qt-resource-rebuilder/injection-policy.json",&ok);
         out.insert("policy",policy); out.insert("policyValid",ok);
         return out;

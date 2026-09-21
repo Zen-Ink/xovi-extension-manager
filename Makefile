@@ -23,3 +23,6 @@ clean :
 settings.o: xovi.h src/settings.cpp src/settings.h sdk/xovi-settings.h sdk/qrr-api.h
 
 notifications.o: src/notifications.cpp src/notifications.h sdk/xovi-notifications.h
+
+main.o inventory.o settings.o notifications.o: src/diagnostics.h
+main.o settings.o notifications.o: src/diagnostics_qt.h

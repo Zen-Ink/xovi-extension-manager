@@ -68,6 +68,7 @@ int main(int argc,char **argv){
     check(call("launcherSet",{{"id","pure-qmd"},{"pageId","main"},{"location","settings"},{"enabled",false}})["ok"].toBool(),"runtime entry can be unpinned");
     auto conflicting=runtimePage;conflicting["registrationToken"]="other-owner";
     check(call("settingsRegister",conflicting)["error"]=="page-already-registered","another lifetime cannot replace a registration");
+    check(call("settingsRegister",conflicting)["diagnostic"].toObject()["category"]=="page","registration rejection carries page recovery classification");
     check(call("settingsUnregister",conflicting)["error"]=="page-already-registered","stale unregister cannot remove a current page");
     check(call("settingsGet",{{"id","pure-qmd"}})["ok"].toBool(),"runtime provider can use optional settings storage");
     check(call("settingsUnregister",runtimePage)["ok"].toBool(),"runtime page unregisters");

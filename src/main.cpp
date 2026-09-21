@@ -1,3 +1,4 @@
+#include "diagnostics_qt.h"
 #include "notifications.h"
 #include "inventory.h"
 #include "jsonutil.h"
@@ -7,7 +8,9 @@
 #include <string>
 
 namespace {
-    char *brokerResponse(const std::string &json) {
+    char *brokerResponse(const std::string &input) {
+        const auto doc=QJsonDocument::fromJson(QByteArray::fromStdString(input));
+        const auto json=doc.isObject() ? QJsonDocument(withDiagnostic(doc.object())).toJson(QJsonDocument::Compact).toStdString() : input;
         char *buffer = static_cast<char *>(std::malloc(json.size() + 1));
         if(buffer == nullptr) return nullptr;
         std::memcpy(buffer, json.c_str(), json.size() + 1);
