@@ -1,3 +1,4 @@
+#include "notifications.h"
 #include "inventory.h"
 #include "jsonutil.h"
 
@@ -15,11 +16,15 @@ namespace {
 }
 
 extern "C" void _xovi_construct() {
+    reconcileDisabledEntries();
     scanDependenciesAtStartup();
 }
 
 extern "C" char *xovi_extension_manager_list(const char *) {
-    return brokerResponse(inventoryToJson(loadInventory()));
+    auto repairs = reconcileDisabledEntries();
+    auto json = inventoryToJson(loadInventory());
+    json.insert(json.size()-1, ",\"automaticRepairs\":" + repairs);
+    return brokerResponse(json);
 }
 
 extern "C" char *xovi_extension_manager_get(const char *value) {
@@ -36,6 +41,10 @@ extern "C" char *xovi_extension_manager_enable(const char *value) {
 
 extern "C" char *xovi_extension_manager_disable(const char *value) {
     return brokerResponse(setExtensionEnabled(value == nullptr ? "" : value, false));
+}
+
+extern "C" char *xovi_extension_manager_repair(const char *value) {
+    return brokerResponse(repairExtensionActiveState(value == nullptr ? "" : value));
 }
 
 extern "C" char *xovi_extension_manager_install(const char *value) {
@@ -69,3 +78,29 @@ extern "C" char *xovi_extension_manager_health(const char *) {
         "\",\"count\":" + std::to_string(inventory.extensions.size()) + "}"
     );
 }
+
+#include "settings.h"
+extern "C" char *xem_settingsRegister(const char *value) { return brokerResponse(settingsCommand("settingsRegister", value)); }
+extern "C" char *xem_settingsUnregister(const char *value) { return brokerResponse(settingsCommand("settingsUnregister", value)); }
+extern "C" char *xem_settingsList(const char *value) { return brokerResponse(settingsCommand("settingsList", value)); }
+extern "C" char *xem_settingsGet(const char *value) { return brokerResponse(settingsCommand("settingsGet", value)); }
+extern "C" char *xem_settingsUpdate(const char *value) { return brokerResponse(settingsCommand("settingsUpdate", value)); }
+extern "C" char *xem_injectionsGet(const char *value) { return brokerResponse(settingsCommand("injectionsGet", value)); }
+extern "C" char *xem_injectionsSet(const char *value) { return brokerResponse(settingsCommand("injectionsSet", value)); }
+extern "C" char *xem_uiReport(const char *value) { return brokerResponse(settingsCommand("uiReport", value)); }
+
+extern "C" char *xem_launcherList(const char *value) { return brokerResponse(settingsCommand("launcherList", value)); }
+extern "C" char *xem_launcherSet(const char *value) { return brokerResponse(settingsCommand("launcherSet", value)); }
+
+extern "C" char *xem_notificationsPost(const char *value) { return brokerResponse(notificationCommand("post", value)); }
+
+extern "C" char *xem_notificationsList(const char *value) { return brokerResponse(notificationCommand("list", value)); }
+
+extern "C" char *xem_notificationsRead(const char *value) { return brokerResponse(notificationCommand("markRead", value)); }
+
+extern "C" char *xem_notificationsDismiss(const char *value) { return brokerResponse(notificationCommand("dismiss", value)); }
+
+extern "C" char *xem_notificationsClear(const char *value) { return brokerResponse(notificationCommand("clear", value)); }
+
+extern "C" char *xem_notificationsActionInvoke(const char *value) { return brokerResponse(notificationCommand("actionInvoke", value)); }
+extern "C" char *xem_notificationsPollActions(const char *value) { return brokerResponse(notificationCommand("pollActions", value)); }

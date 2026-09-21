@@ -101,6 +101,14 @@ whether XOVI has already loaded a plugin in the current process:
   points somewhere else.
 - `requiresRestart`: whether the current process must restart before disk
   changes take effect.
+- `activationNeedsRepair`: whether the active entry requires reconciliation.
+- `activationIssue`: one of `missing`, `dangling`, `unexpected`, `wrong-target`,
+  `absolute-link`, or `conflict`; empty when no repair is needed.
+
+When `enabled` and `effectiveEnabled` differ, managed packages expose the
+`repair` action. Repair follows `manifest.enabled`, normalizes created or
+matching active symlinks to relative targets, removes stale QMD symlinks from
+old order values, and preserves unknown non-symlink files as conflicts.
 
 For native `.so` extensions, the manager compares these default paths:
 
@@ -118,6 +126,14 @@ active: /home/root/xovi/exthome/qt-resource-rebuilder/<order>-<id>.qmd
 
 If the resolved symlink target is the same as the source path, or both paths
 refer to the same file, the manager treats the active entry as matching.
+This includes the case where `sourceEntryPath` itself is a symlink to the active
+target.
+
+If `sourceEntryPath` is missing while `activeEntryTarget` points to another file
+inside the same package directory, the package manifest and disk layout are
+inconsistent. Fix it by reinstalling the package with files at `manifest.entry`,
+by changing `manifest.entry` to the actual relative entry path, or by providing
+a symlink at `manifest.entry`.
 
 ## 5. Common Issues
 
@@ -345,3 +361,35 @@ flow:
 If the file source is untrusted, ownership is unclear, or multiple active-path
 conflicts exist, back up and inspect manually before calling `enable`. Do not
 let `enable` overwrite an active entry whose ownership is unclear.
+
+
+Disabled managed packages are reconciled at manager startup and during inventory
+or settings/launcher discovery. Residual symlinks at their active path and old
+names pointing to the same owned source are removed. Unknown regular files and
+dependency/self-disable conflicts are preserved and reported, not overwritten.
+The `list` response includes `automaticRepairs`; failed cleanup still appears as
+an activation issue. Cleanup never unloads a running native library: a restart
+may still be required, while pinned entries disappear immediately.
+
+## Advisory metadata versus runtime failures
+
+`unmanaged`, `missing-manifest`, and `qmd-order-conflict:<id>` are deduplicated
+`warnings`, not `issues` requiring repair. Equal QMD order numbers alone do not
+prove a conflict; explicit dependency cycles/order violations remain blocking
+issues. Legacy regular files and runtime-only records are not subject to the
+managed-package symlink repair policy. Runtime-only records do not invent a
+missing on-disk entry or a restart requirement.
+
+The QMD runtime dependency on qt-resource-rebuilder is implicit even if omitted
+from a manifest. Missing declaration is not evidence of missing installation.
+Presence is resolved against installed packages and XOVI runtime records; failed
+runtime loading remains `runtime-dependency-failed:<name>`, and actual absence
+remains `missing-runtime-dependency:qt-resource-rebuilder`. Explicitly disabled
+managed dependencies remain disabled even if still loaded pending a restart.
+
+Runtime enumeration uses XOVI's scanned-extension API, with the extension-name
+API as fallback. Runtime names are matched both by manifest ID and `.so` basename
+so an aliased package is not duplicated as an unmanaged plugin. `runtime.name`
+records the actual XOVI name, alongside `seen`, load state, error and runtime
+version. Unknown versions are advisory (`dependency-version-unknown`) rather
+than a fabricated incompatibility; known incompatible versions still block.

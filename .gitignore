@@ -5,3 +5,6 @@ xovi.h
 *.o
 rcc/
 .history/
+
+/build/
+*.local

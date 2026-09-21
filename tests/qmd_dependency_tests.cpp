@@ -1,4 +1,6 @@
 #include "inventory.h"
+#include "jsonutil.h"
+#include <algorithm>
 #include "xovi.h"
 
 #include <cstdlib>
@@ -128,6 +130,49 @@ public:
             fs::create_directories(activeDir);
             fs::create_symlink(package / entry, activeDir / (id + ".so"));
         }
+    }
+
+    void addExtensionWithSymlinkedSourceEntry(const std::string &id,
+                                              const std::string &version,
+                                              bool enabled,
+                                              bool active) {
+        fs::path package = extensionPackages() / id;
+        fs::create_directories(package / "package");
+        write(package / "package" / (id + ".so"), "test extension fixture\n");
+        fs::create_symlink(fs::path("package") / (id + ".so"), package / (id + ".so"));
+        write(package / "manifest.json",
+              "{\"manifestVersion\":1,\"type\":\"extension\","
+              "\"id\":\"" + id + "\",\"name\":\"" + id + "\","
+              "\"version\":\"" + version + "\",\"entry\":\"" + id + ".so\","
+              "\"enabled\":" + std::string(enabled ? "true" : "false") + ",\"requires\":{\"xovi\":\">=0.3.0\","
+              "\"extensions\":{},\"xochitl\":[],\"architectures\":[]}}\n");
+        if(active) {
+            fs::path activeDir = root_ / "extensions.d";
+            fs::create_directories(activeDir);
+            fs::create_symlink(package / "package" / (id + ".so"), activeDir / (id + ".so"));
+        }
+    }
+
+    void addExtensionWithXochitlRequirements(const std::string &id,
+                                              const std::vector<std::string> &requirements) {
+        fs::path package = extensionPackages() / id;
+        fs::create_directories(package);
+        write(package / (id + ".so"), "test extension fixture\n");
+
+        std::ostringstream xochitl;
+        xochitl << "[";
+        for(size_t i = 0; i < requirements.size(); ++i) {
+            if(i != 0) xochitl << ",";
+            xochitl << "\"" << requirements[i] << "\"";
+        }
+        xochitl << "]";
+
+        write(package / "manifest.json",
+              "{\"manifestVersion\":1,\"type\":\"extension\","
+              "\"id\":\"" + id + "\",\"name\":\"" + id + "\","
+              "\"version\":\"1.0.0\",\"entry\":\"" + id + ".so\","
+              "\"enabled\":false,\"requires\":{\"xovi\":\">=0.3.0\","
+              "\"extensions\":{},\"xochitl\":" + xochitl.str() + ",\"architectures\":[]}}\n");
     }
 
     void addDuplicateQmd(const std::string &directory, const std::string &id, int order) {
@@ -413,6 +458,43 @@ void successfulDependency() {
     requireNotContains(json, "qmd-dependency-cycle:");
 }
 
+void xochitlXSegmentsMatch() {
+    Fixture fixture;
+    setenv("XOVI_XOCHITL_VERSION", "3.28.0.163", 1);
+    fixture.addExtensionWithXochitlRequirements(
+        "x-segment-match", {"3.27.x.x", "3.28.x.x"}
+    );
+    fixture.addExtensionWithXochitlRequirements("exact-match", {"3.28.0.163"});
+    fixture.addExtensionWithXochitlRequirements("legacy-star-match", {"3.28.*"});
+
+    Inventory inventory = loadInventory(false);
+    requireNotContains(packageJson(inventory, "x-segment-match"), "xochitl-version-incompatible");
+    requireNotContains(packageJson(inventory, "exact-match"), "xochitl-version-incompatible");
+    requireNotContains(packageJson(inventory, "legacy-star-match"), "xochitl-version-incompatible");
+}
+
+void xochitlXSegmentsRequireSameSegmentCount() {
+    Fixture fixture;
+    setenv("XOVI_XOCHITL_VERSION", "3.28.0.163", 1);
+    fixture.addExtensionWithXochitlRequirements("short-x-pattern", {"3.28.x"});
+    fixture.addExtensionWithXochitlRequirements("long-x-pattern", {"3.28.x.x.x"});
+
+    Inventory inventory = loadInventory(false);
+    requireContains(packageJson(inventory, "short-x-pattern"), "xochitl-version-incompatible");
+    requireContains(packageJson(inventory, "long-x-pattern"), "xochitl-version-incompatible");
+}
+
+void xochitlXSegmentsRejectNonMatches() {
+    Fixture fixture;
+    setenv("XOVI_XOCHITL_VERSION", "3.28.0.163", 1);
+    fixture.addExtensionWithXochitlRequirements("different-release", {"3.27.x.x"});
+    fixture.addExtensionWithXochitlRequirements("partial-x-segment", {"3.28.0.16x"});
+
+    Inventory inventory = loadInventory(false);
+    requireContains(packageJson(inventory, "different-release"), "xochitl-version-incompatible");
+    requireContains(packageJson(inventory, "partial-x-segment"), "xochitl-version-incompatible");
+}
+
 void availableRootsAreCanonical() {
     Fixture fixture;
     fixture.addExtension("native", "1.0.0", true, true);
@@ -445,6 +527,18 @@ void entryMayUseSafeRelativeSubdirectory() {
     requireContains(qmdJson, "qmd.available/nested-qmd/qmd/nested-qmd.qmd");
     requireContains(qmdJson, "\"sourceEntryExists\":true");
     requireContains(qmdJson, "\"activeEntryMatches\":true");
+}
+
+void sourceEntrySymlinkMatchesActiveTarget() {
+    Fixture fixture;
+    fixture.addExtensionWithSymlinkedSourceEntry("symlinked-native", "1.0.0", true, true);
+
+    std::string json = packageJson(loadInventory(false), "symlinked-native");
+    requireContains(json, "\"sourceEntryExists\":true");
+    requireContains(json, "\"activeEntryMatches\":true");
+    requireContains(json, "\"activeEntryConflict\":\"\"");
+    requireNotContains(json, "entry-missing");
+    requireNotContains(json, "active-entry-conflict");
 }
 
 void typedPathMatchesFullEntryBeforeBasename() {
@@ -590,6 +684,133 @@ void activeOrderChangeRemovesStaleSymlink() {
     require(!fixture.activeQmdExists(30, "standalone"), "old-order active QMD symlink was left stale");
 }
 
+void repairCreatesRelativeActiveSymlink() {
+    Fixture fixture;
+    fixture.addExtension("repairable", "1.0.0", true, false);
+
+    std::string result = repairExtensionActiveState("repairable");
+    requireContains(result, "\"ok\":true");
+    requireContains(result, "active-entry-symlink-created");
+    fs::path active = fixture.extensionPackage("repairable").parent_path().parent_path() /
+        "extensions.d" / "repairable.so";
+    require(fs::is_symlink(active), "repair did not create active extension symlink");
+    require(fs::read_symlink(active).is_relative(), "repair created an absolute symlink");
+    requireContains(packageJson(loadInventory(false), "repairable"), "\"effectiveEnabled\":true");
+    requireContains(packageJson(loadInventory(false), "repairable"), "\"activationNeedsRepair\":false");
+}
+
+void repairIsAvailableForAbsoluteMatchingSymlink() {
+    Fixture fixture;
+    fixture.addExtension("absolute-link", "1.0.0", true, true);
+    requireContains(packageJson(loadInventory(false), "absolute-link"), "\"availableActions\":[\"inspect\",\"disable\",\"repair\"");
+    requireContains(packageJson(loadInventory(false), "absolute-link"), "\"activationIssue\":\"absolute-link\"");
+    std::string result = repairExtensionActiveState("absolute-link");
+    requireContains(result, "active-entry-symlink-normalized-relative");
+}
+
+void repairReplacesWrongSymlinkButPreservesRegularFile() {
+    Fixture fixture;
+    fixture.addExtension("repairable", "1.0.0", true, false);
+    fixture.addExtension("other", "1.0.0", false, false);
+    fs::path activeDir = fixture.extensionPackage("repairable").parent_path().parent_path() / "extensions.d";
+    fs::create_directories(activeDir);
+    fs::create_symlink(fixture.extensionPackage("other") / "other.so", activeDir / "repairable.so");
+
+    std::string replaced = repairExtensionActiveState("repairable");
+    requireContains(replaced, "\"ok\":true");
+    requireContains(replaced, "active-entry-symlink-replaced");
+    require(fs::read_symlink(activeDir / "repairable.so").is_relative(), "replacement symlink is absolute");
+
+    fs::remove(activeDir / "repairable.so");
+    std::ofstream output(activeDir / "repairable.so");
+    output << "unknown file\n";
+    output.close();
+    std::string conflict = repairExtensionActiveState("repairable");
+    requireContains(conflict, "\"error\":\"active-entry-conflict\"");
+    require(!fs::is_symlink(activeDir / "repairable.so"), "repair overwrote unknown regular file");
+}
+
+void repairDisabledQmdRemovesOldOrderSymlink() {
+    Fixture fixture;
+    fixture.addQmd("old-order", "1.0.0", 30, false, {}, false);
+    fs::path activeDir = fixture.qmdPackage("old-order").parent_path().parent_path() /
+        "exthome" / "qt-resource-rebuilder";
+    fs::create_directories(activeDir);
+    fs::create_symlink(fixture.qmdPackage("old-order") / "old-order.qmd", activeDir / "010-old-order.qmd");
+
+    std::string result = repairExtensionActiveState("old-order");
+    requireContains(result, "\"ok\":true");
+    requireContains(result, "stale-qmd-active-symlink-removed");
+    require(!fs::exists(activeDir / "010-old-order.qmd"), "repair left old-order QMD symlink active");
+}
+
+void danglingActiveEntryIsNotEffectivelyEnabled() {
+    Fixture fixture;
+    fixture.addExtension("dangling", "1.0.0", true, true);
+    fs::path source = fixture.extensionPackage("dangling") / "dangling.so";
+    fs::path payload = fixture.extensionPackage("dangling") / "payload.so";
+    fs::rename(source, payload);
+    fs::create_symlink("payload.so", source);
+    fs::remove(payload);
+    std::string json = packageJson(loadInventory(false), "dangling");
+    requireContains(json, "\"effectiveEnabled\":false");
+    requireContains(json, "\"activationIssue\":\"dangling\"");
+    requireContains(json, "entry-missing");
+    requireContains(json, "effective-disabled");
+}
+
+void repairDisabledRemovesStaleQmdWithMissingSource() {
+    Fixture fixture;
+    fixture.addQmd("missing-source", "1.0.0", 30, false, {}, false);
+    fs::path package = fixture.qmdPackage("missing-source");
+    fs::path activeDir = package.parent_path().parent_path() / "exthome" / "qt-resource-rebuilder";
+    fs::create_directories(activeDir);
+    fs::create_symlink(package / "missing-source.qmd", activeDir / "010-missing-source.qmd");
+    fs::remove(package / "missing-source.qmd");
+
+    std::string result = repairExtensionActiveState("missing-source");
+    requireContains(result, "\"ok\":true");
+    requireContains(result, "stale-qmd-active-symlink-removed");
+    require(!fs::exists(activeDir / "010-missing-source.qmd"), "repair left stale QMD with missing source");
+}
+
+void repairDisabledPreservesDisablePreflight() {
+    Fixture fixture;
+    fixture.addQmd("base", "1.0.0", 10, false, {}, true);
+    fixture.addQmd("consumer", "1.0.0", 20, true, {{"base", ">=1.0.0"}}, true);
+    requireContains(repairExtensionActiveState("base"), "\"error\":\"qmd-required-by\"");
+
+    fixture.addExtension("xovi-extension-manager", "1.0.0", false, true);
+    requireContains(repairExtensionActiveState("xovi-extension-manager"), "self-disable-blocked");
+}
+
+void disableCleansConflictingAndStaleEntries() {
+    Fixture fixture;
+    fixture.addExtension("disabled-auto", "1.0.0", false, true);
+    auto active=fixture.extensionPackage("disabled-auto").parent_path().parent_path()/"extensions.d"/"disabled-auto.so";
+    fs::remove(active); fs::create_symlink("../missing.so", active);
+    requireContains(reconcileDisabledEntries(), "\"ok\":true");
+    require(!fs::is_symlink(active), "auto repair left dangling disabled entry");
+    require(reconcileDisabledEntries()=="[]", "auto repair is not idempotent");
+    auto alias=active.parent_path()/"old-name.so";
+    fs::create_symlink(fixture.extensionPackage("disabled-auto")/"disabled-auto.so",alias);
+    requireContains(reconcileDisabledEntries(), "stale-active-symlink-removed");
+    require(!fs::is_symlink(alias), "auto repair left old native entry name");
+    fs::create_symlink("../other.so",active);
+    requireContains(setExtensionEnabled("disabled-auto",false), "\"ok\":true");
+    require(!fs::is_symlink(active), "disable left wrong-target symlink");
+    std::ofstream(active)<<"preserve me";
+    requireContains(reconcileDisabledEntries(), "active-entry-conflict");
+    require(fs::is_regular_file(active), "auto repair deleted regular file");
+    fixture.addQmd("stale-auto", "1.0.0", 30, false, {}, false);
+    auto qmdDir=fixture.qmdPackage("stale-auto").parent_path().parent_path()/"exthome"/"qt-resource-rebuilder";
+    fs::create_directories(qmdDir);
+    auto old=qmdDir/"010-stale-auto.qmd";
+    fs::create_symlink(fixture.qmdPackage("stale-auto")/"stale-auto.qmd",old);
+    requireContains(setExtensionEnabled("stale-auto",false), "\"ok\":true");
+    require(!fs::is_symlink(old), "disable left old-order QMD link");
+}
+
 void newPackageWithMissingDependencyStaysDisabled() {
     Fixture fixture;
     std::string result = fixture.installQmdUpdate(
@@ -604,14 +825,75 @@ void newPackageWithMissingDependencyStaysDisabled() {
             "failed enable left an active QMD symlink");
 }
 
+static int mockRuntimeState=XOVI_EXTENSION_INITIALIZED;
+struct RuntimeApiFixture {
+    XoViEnvironment env{};
+    RuntimeApiFixture(bool scanned=true) {
+        auto count=+[](){return 1;};
+        auto names=+[](const char **names,int limit){if(limit>0)names[0]="qt-resource-rebuilder";return limit>0 ? 1 : 0;};
+        if(scanned){env.getScannedExtensionCount=count;env.getScannedExtensionNames=names;}
+        else {env.getExtensionCount=count;env.getExtensionNames=names;}
+        env.getExtensionLoadState=+[](const char *){return mockRuntimeState;};
+        env.getExtensionVersion=+[](const char *,unsigned char *a,unsigned char *b,unsigned char *c){*a=0;*b=3;*c=0;return 0;};
+        Environment=&env;setenv("XOVI_EXTENSION_MANAGER_DISABLE_RUNTIME_API","0",1);
+    }
+    ~RuntimeApiFixture(){Environment=nullptr;setenv("XOVI_EXTENSION_MANAGER_DISABLE_RUNTIME_API","1",1);mockRuntimeState=XOVI_EXTENSION_INITIALIZED;}
+};
+void runtimeAndWarningDiagnostics() {
+    Fixture f;
+    f.addQmd("one","1.0.0",50,true,{},true);
+    f.addQmd("two","1.0.0",50,true,{},true);
+    // Reproduce a working QMD that never declared the implicit QRR dependency.
+    std::ofstream(f.qmdPackage("one")/"manifest.json") << R"({"manifestVersion":1,"type":"qmd","id":"one","name":"One","version":"1.0.0","entry":"one.qmd","enabled":true,"order":50})";
+    auto inv=loadInventory();
+    auto output=extensionToJson(inv,inv.extensions[findExtension(inv,"one")]);
+    requireNotContains(jsonutil::stringArray(jsonutil::readStringArray(output,"issues")),"missing-runtime-dependency");
+    requireNotContains(jsonutil::stringArray(jsonutil::readStringArray(output,"issues")),"qmd-order-conflict");
+    requireContains(jsonutil::stringArray(jsonutil::readStringArray(output,"warnings")),"qmd-order-conflict");
+    const auto root=f.extensionPackage("qt-resource-rebuilder").parent_path().parent_path();
+    std::ofstream(root/"extensions.d"/"vendor.so") << "fixture";
+    inv=loadInventory();output=extensionToJson(inv,inv.extensions[findExtension(inv,"vendor")]);
+    requireContains(output,"\"activationNeedsRepair\":false");
+    requireNotContains(jsonutil::stringArray(jsonutil::readStringArray(output,"issues")),"unmanaged");
+    requireContains(jsonutil::stringArray(jsonutil::readStringArray(output,"warnings")),"unmanaged");
+    fs::remove(root/"extensions.d"/"qt-resource-rebuilder.so");
+    fs::remove_all(f.extensionPackage("qt-resource-rebuilder"));
+    inv=loadInventory();output=extensionToJson(inv,inv.extensions[findExtension(inv,"one")]);
+    requireContains(jsonutil::stringArray(jsonutil::readStringArray(output,"issues")),"missing-runtime-dependency");
+    for(bool scanned:{true,false}) {
+        RuntimeApiFixture runtime(scanned);
+        inv=loadInventory();output=extensionToJson(inv,inv.extensions[findExtension(inv,"one")]);
+        requireNotContains(jsonutil::stringArray(jsonutil::readStringArray(output,"issues")),"missing-runtime-dependency");
+        const auto dependency=extensionToJson(inv,inv.extensions[findExtension(inv,"qt-resource-rebuilder")]);
+        requireContains(dependency,"\"activationNeedsRepair\":false");
+        requireContains(dependency,"\"requiresRestart\":false");
+        requireNotContains(dependency,"entry-missing");
+        mockRuntimeState=XOVI_EXTENSION_LINK_FAILED;
+        inv=loadInventory();output=extensionToJson(inv,inv.extensions[findExtension(inv,"one")]);
+        requireContains(output,"runtime-dependency-failed:qt-resource-rebuilder");
+    }
+    f.addExtensionWithEntry("rebuilder-package","0.3.0","qt-resource-rebuilder.so",true,true);
+    RuntimeApiFixture runtime;
+    inv=loadInventory();
+    require(findExtension(inv,"qt-resource-rebuilder")<0,"runtime alias must not produce a duplicate package");
+    const auto &p=inv.extensions[findExtension(inv,"rebuilder-package")];
+    require(p.runtime.seen && p.runtime.loadState==XOVI_EXTENSION_INITIALIZED,"runtime state should merge by .so basename");
+    output=extensionToJson(inv,inv.extensions[findExtension(inv,"one")]);
+    requireNotContains(output,"missing-runtime-dependency");
+}
+
 void schemaAdvertisesQmdDependencies() {
     std::string schema = schemaJson();
     requireContains(schema, "\"qmd\":{\"scroll-screen-up-or-down\":\">=0.1.2\"}");
+    requireContains(schema, "\"xochitl\":[\"3.27.x.x\",\"3.28.x.x\"]");
+    requireContains(schema, "lowercase x as a complete dot-delimited segment with the same segment count");
+    requireContains(schema, "\"repair\":\"reconcile active symlinks with manifest.enabled using relative targets\"");
 }
 }
 
 int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"runtime aliases, implicit dependencies and warning severity",runtimeAndWarningDiagnostics},
         {"requires.qmd parse and JSON", parseAndJsonRoundTrip},
         {"missing dependency", missingDependency},
         {"legacy dependency does not satisfy", legacyDependencyDoesNotSatisfy},
@@ -626,8 +908,12 @@ int main() {
         {"direct cycle", directCycle},
         {"indirect cycle", indirectCycle},
         {"successful dependency", successfulDependency},
+        {"xochitl x segments match", xochitlXSegmentsMatch},
+        {"xochitl x segments require same count", xochitlXSegmentsRequireSameSegmentCount},
+        {"xochitl x segments reject non-matches", xochitlXSegmentsRejectNonMatches},
         {"available roots are canonical", availableRootsAreCanonical},
         {"entry may use safe relative subdirectory", entryMayUseSafeRelativeSubdirectory},
+        {"source entry symlink matches active target", sourceEntrySymlinkMatchesActiveTarget},
         {"typed path matches full entry before basename", typedPathMatchesFullEntryBeforeBasename},
         {"reinstall preserves runtime data home", reinstallPreservesRuntimeDataHome},
         {"self disable is blocked", selfDisableBlocked},
@@ -640,6 +926,14 @@ int main() {
         {"dependency order upgrade preflight", dependencyOrderUpgradePreflight},
         {"active package own dependency upgrade preflight", activePackageOwnDependencyUpgradePreflight},
         {"active order change removes stale symlink", activeOrderChangeRemovesStaleSymlink},
+        {"repair creates relative active symlink", repairCreatesRelativeActiveSymlink},
+        {"repair is available for absolute matching symlink", repairIsAvailableForAbsoluteMatchingSymlink},
+        {"repair replaces symlink and preserves regular file", repairReplacesWrongSymlinkButPreservesRegularFile},
+        {"repair disabled QMD removes old order symlink", repairDisabledQmdRemovesOldOrderSymlink},
+        {"dangling active entry is not enabled", danglingActiveEntryIsNotEffectivelyEnabled},
+        {"repair removes stale QMD with missing source", repairDisabledRemovesStaleQmdWithMissingSource},
+        {"repair disabled preserves preflight", repairDisabledPreservesDisablePreflight},
+        {"automatic disabled entry cleanup", disableCleansConflictingAndStaleEntries},
         {"new package with missing dependency stays disabled", newPackageWithMissingDependencyStaysDisabled},
         {"schema advertises qmd dependencies", schemaAdvertisesQmdDependencies},
     };

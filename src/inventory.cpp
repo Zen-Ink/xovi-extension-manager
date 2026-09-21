@@ -13,6 +13,7 @@
 #include <spawn.h>
 #include <set>
 #include <sstream>
+#include <mutex>
 #include <cstdio>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -24,8 +25,12 @@
 extern char **environ;
 
 namespace {
+    std::string fileName(const std::string &path);
     static bool PENDING_RESTART = false;
     static std::set<std::string> PENDING_RESTART_PACKAGES;
+    static std::mutex OPERATION_MUTEX;
+    static std::mutex PROVIDER_MUTEX;
+    static std::set<std::string> SUPPRESSED_PROVIDERS;
 
     std::string trim(const std::string &value) {
         size_t start = 0;
@@ -65,6 +70,62 @@ namespace {
     std::string absolutePathFrom(const std::string &baseDir, const std::string &path) {
         if(path.empty() || path[0] == '/') return path;
         return joinPath(baseDir, path);
+    }
+
+    std::string lexicallyNormalizePath(const std::string &path) {
+        const bool absolute = !path.empty() && path[0] == '/';
+        std::vector<std::string> normalized;
+        size_t start = 0;
+        while(start < path.size()) {
+            while(start < path.size() && path[start] == '/') ++start;
+            size_t end = path.find('/', start);
+            std::string part = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            if(part == "..") {
+                if(!normalized.empty() && normalized.back() != "..") normalized.pop_back();
+                else if(!absolute) normalized.push_back(part);
+            } else if(!part.empty() && part != ".") {
+                normalized.push_back(part);
+            }
+            if(end == std::string::npos) break;
+            start = end + 1;
+        }
+        std::ostringstream out;
+        if(absolute) out << "/";
+        for(size_t i = 0; i < normalized.size(); ++i) {
+            if(i != 0) out << "/";
+            out << normalized[i];
+        }
+        return out.str().empty() ? (absolute ? "/" : ".") : out.str();
+    }
+
+    std::vector<std::string> pathParts(const std::string &path) {
+        std::vector<std::string> parts;
+        size_t start = 0;
+        while(start < path.size()) {
+            while(start < path.size() && path[start] == '/') ++start;
+            size_t end = path.find('/', start);
+            if(start < path.size()) parts.push_back(path.substr(start, end == std::string::npos ? std::string::npos : end - start));
+            if(end == std::string::npos) break;
+            start = end + 1;
+        }
+        return parts;
+    }
+
+    std::string relativePathFrom(const std::string &baseDir, const std::string &target) {
+        if(target.empty() || target[0] != '/') return target;
+        std::vector<std::string> base = pathParts(baseDir);
+        std::vector<std::string> destination = pathParts(target);
+        size_t common = 0;
+        while(common < base.size() && common < destination.size() && base[common] == destination[common]) ++common;
+        std::vector<std::string> result;
+        for(size_t i = common; i < base.size(); ++i) result.push_back("..");
+        result.insert(result.end(), destination.begin() + common, destination.end());
+        std::ostringstream out;
+        for(size_t i = 0; i < result.size(); ++i) {
+            if(i != 0) out << "/";
+            out << result[i];
+        }
+        return out.str().empty() ? "." : out.str();
     }
 
     bool pathsReferToSameFile(const std::string &left, const std::string &right) {
@@ -125,6 +186,7 @@ namespace {
     PackageType packageTypeFromString(const std::string &type) {
         if(type == "extension") return PACKAGE_EXTENSION;
         if(type == "qmd") return PACKAGE_QMD;
+        if(type == "qml") return PACKAGE_QML;
         return PACKAGE_UNKNOWN;
     }
 
@@ -132,6 +194,7 @@ namespace {
         switch(type) {
             case PACKAGE_EXTENSION: return "extension";
             case PACKAGE_QMD: return "qmd";
+            case PACKAGE_QML: return "qml";
             default: return "unknown";
         }
     }
@@ -139,6 +202,7 @@ namespace {
     PackageType inferPackageType(const std::string &entry) {
         if(hasSuffix(entry, ".so")) return PACKAGE_EXTENSION;
         if(hasSuffix(entry, ".qmd")) return PACKAGE_QMD;
+        if(hasSuffix(entry, ".qml")) return PACKAGE_QML;
         return PACKAGE_UNKNOWN;
     }
 
@@ -159,6 +223,7 @@ namespace {
         if(!validRelativeEntry(entry)) return false;
         if(type == PACKAGE_EXTENSION) return hasSuffix(entry, ".so");
         if(type == PACKAGE_QMD) return hasSuffix(entry, ".qmd");
+        if(type == PACKAGE_QML) return hasSuffix(entry, ".qml");
         return false;
     }
 
@@ -218,7 +283,9 @@ namespace {
                 return state;
             }
             std::string absoluteTarget = absolutePathFrom(parentPath(active), state.target);
-            if(state.target == source || absoluteTarget == source || pathsReferToSameFile(absoluteTarget, source)) {
+            if(!isRegularFile(source)) {
+                state.conflict = "active-entry-dangling";
+            } else if(state.target == source || absoluteTarget == source || pathsReferToSameFile(absoluteTarget, source)) {
                 state.matchesSource = true;
             } else {
                 state.conflict = "active-entry-conflict";
@@ -238,9 +305,78 @@ namespace {
         return inspectActiveEntry(manifest).matchesSource;
     }
 
+    bool createRelativeSymlink(const std::string &source, const std::string &active, std::string &error) {
+        std::string target = relativePathFrom(parentPath(active), source);
+        if(symlink(target.c_str(), active.c_str()) == 0) return true;
+        error = std::strerror(errno);
+        return false;
+    }
+
+    bool replaceSymlinkWithRelativeTarget(const std::string &source, const std::string &active, std::string &error) {
+        std::string temporary = active + ".xovi-repair-" + std::to_string(static_cast<long long>(getpid()));
+        unsigned int suffix = 0;
+        while(isPathPresent(temporary)) temporary = active + ".xovi-repair-" + std::to_string(static_cast<long long>(getpid())) + "-" + std::to_string(++suffix);
+        if(!createRelativeSymlink(source, temporary, error)) return false;
+        if(rename(temporary.c_str(), active.c_str()) == 0) return true;
+        int savedErrno = errno;
+        unlink(temporary.c_str());
+        error = std::strerror(savedErrno);
+        return false;
+    }
+
+    std::vector<std::string> staleActivePaths(const ExtensionManifest &manifest) {
+        std::vector<std::string> stale;
+        const std::string activeDir = parentPath(enabledEntryPath(manifest));
+        const std::string suffix = manifest.type == PACKAGE_QMD ? ".qmd" : manifest.type == PACKAGE_QML ? ".qml" : ".so";
+        DIR *dir = opendir(activeDir.c_str());
+        if(dir == nullptr) return stale;
+        while(dirent *entry = readdir(dir)) {
+            if(entry->d_name[0] == '.' || !hasSuffix(entry->d_name, suffix)) continue;
+            std::string candidate = joinPath(activeDir, entry->d_name);
+            if(candidate == enabledEntryPath(manifest) || !isSymlink(candidate)) continue;
+            ExtensionManifest probe = manifest;
+            probe.enabledEntryPathOverride = candidate;
+            if(inspectActiveEntry(probe).matchesSource) {
+                stale.push_back(candidate);
+                continue;
+            }
+            std::string target;
+            std::string ignored;
+            if(readSymlinkTarget(candidate, target, ignored) &&
+                lexicallyNormalizePath(absolutePathFrom(parentPath(candidate), target)) == lexicallyNormalizePath(sourceEntryPath(manifest))) {
+                stale.push_back(candidate);
+            }
+        }
+        closedir(dir);
+        return stale;
+    }
+
+    std::string activationIssue(const ExtensionManifest &manifest) {
+        if(!manifest.managed || !manifest.hasManifest) return "";
+        ActiveEntryState active = inspectActiveEntry(manifest);
+        if(!manifest.enabled) {
+            if(active.present || !staleActivePaths(manifest).empty()) return "unexpected";
+            return "";
+        }
+        if(!active.present) return "missing";
+        if(!active.symlink) return "conflict";
+        if(!active.matchesSource) {
+            if(active.conflict == "active-entry-dangling") return "dangling";
+            return active.conflict == "active-entry-conflict" ? "wrong-target" : "conflict";
+        }
+        if(!active.target.empty() && active.target[0] == '/') return "absolute-link";
+        if(!staleActivePaths(manifest).empty()) return "unexpected";
+        return "";
+    }
+
+    bool needsActiveRepair(const ExtensionManifest &manifest) {
+        return !activationIssue(manifest).empty();
+    }
+
     void markRestartPending(const ExtensionManifest &manifest) {
+        if(manifest.type == PACKAGE_QML) return;
         PENDING_RESTART = true;
-        if(!manifest.id.empty()) PENDING_RESTART_PACKAGES.insert(manifest.id);
+        if(manifest.type != PACKAGE_QML && !manifest.id.empty()) PENDING_RESTART_PACKAGES.insert(manifest.id);
     }
 
     bool mkdirRecursive(const std::string &path) {
@@ -636,8 +772,41 @@ namespace {
         return patternIndex == wanted.size();
     }
 
+    bool xSegmentVersionMatches(const std::string &pattern, const std::string &value) {
+        std::string wanted = trim(pattern);
+        if(wanted.empty() || value.empty()) return false;
+
+        size_t wantedStart = 0;
+        size_t valueStart = 0;
+        bool hasWildcardSegment = false;
+        while(true) {
+            size_t wantedEnd = wanted.find('.', wantedStart);
+            size_t valueEnd = value.find('.', valueStart);
+            if((wantedEnd == std::string::npos) != (valueEnd == std::string::npos)) return false;
+
+            std::string wantedSegment = wanted.substr(wantedStart, wantedEnd - wantedStart);
+            std::string valueSegment = value.substr(valueStart, valueEnd - valueStart);
+            if(wantedSegment.empty() || valueSegment.empty()) return false;
+            if(wantedSegment == "x") {
+                hasWildcardSegment = true;
+            } else if(wantedSegment != valueSegment) {
+                return false;
+            }
+
+            if(wantedEnd == std::string::npos) break;
+            wantedStart = wantedEnd + 1;
+            valueStart = valueEnd + 1;
+        }
+        return hasWildcardSegment;
+    }
+
     bool xochitlVersionMatches(const std::vector<std::string> &requirements, const std::string &actual) {
-        for(const std::string &wanted : requirements) {
+        for(const std::string &requirement : requirements) {
+            std::string wanted = trim(requirement);
+            if(wanted.find('x') != std::string::npos) {
+                if(xSegmentVersionMatches(wanted, actual)) return true;
+                if(wanted.find('*') == std::string::npos) continue;
+            }
             if(wildcardMatches(wanted, actual)) return true;
         }
         return false;
@@ -782,20 +951,28 @@ namespace {
 
     void attachRuntimeState(Inventory &inventory) {
         if(runtimeStateDisabledByEnv()) return;
-        if(Environment == nullptr || Environment->getScannedExtensionCount == nullptr || Environment->getScannedExtensionNames == nullptr) {
+        if(Environment == nullptr) {
             return;
         }
 
         std::map<std::string, size_t> byId;
         for(size_t i = 0; i < inventory.extensions.size(); ++i) {
-            if(inventory.extensions[i].type == PACKAGE_EXTENSION) byId[inventory.extensions[i].id] = i;
+            if(inventory.extensions[i].type != PACKAGE_EXTENSION) continue;
+            const auto &p=inventory.extensions[i];
+            byId[p.id] = i;
+            const auto entry=fileName(p.entry);
+            if(hasSuffix(entry,".so")) byId.emplace(entry.substr(0,entry.size()-3),i);
         }
 
-        int count = Environment->getScannedExtensionCount();
+        const bool scanned = Environment->getScannedExtensionCount && Environment->getScannedExtensionNames;
+        const auto countFn = scanned ? Environment->getScannedExtensionCount : Environment->getExtensionCount;
+        const auto namesFn = scanned ? Environment->getScannedExtensionNames : Environment->getExtensionNames;
+        if(!countFn || !namesFn) return;
+        int count = countFn();
         if(count <= 0) return;
 
         std::vector<const char *> names(static_cast<size_t>(count));
-        int actual = Environment->getScannedExtensionNames(names.data(), count);
+        int actual = std::max(0, std::min(count, namesFn(names.data(), count)));
         for(int i = 0; i < actual; ++i) {
             if(names[static_cast<size_t>(i)] == nullptr) continue;
             std::string runtimeName = names[static_cast<size_t>(i)];
@@ -812,6 +989,11 @@ namespace {
 
             ExtensionManifest &manifest = inventory.extensions[index];
             manifest.runtime.seen = true;
+            manifest.runtime.name = runtimeName;
+            if(!scanned) {
+                manifest.runtime.loadState=XOVI_EXTENSION_DISCOVERED;
+                manifest.runtime.loadStateName=loadStateName(XOVI_EXTENSION_DISCOVERED);
+            }
             if(Environment->getExtensionLoadState != nullptr) {
                 manifest.runtime.loadState = Environment->getExtensionLoadState(runtimeName.c_str());
                 manifest.runtime.loadStateName = loadStateName(manifest.runtime.loadState);
@@ -889,14 +1071,13 @@ namespace {
 
     std::vector<std::string> computeIssues(const Inventory &inventory, const ExtensionManifest &manifest) {
         std::vector<std::string> issues = manifest.errors;
-        if(!manifest.managed) issues.push_back("unmanaged");
-        if(!manifest.hasManifest) issues.push_back("missing-manifest");
+
         if(!manifest.valid) issues.push_back("manifest-invalid");
-        if(manifest.valid && !isPathPresent(sourceEntryPath(manifest))) issues.push_back("entry-missing");
+        if(manifest.valid && manifest.source != "runtime" && !isRegularFile(sourceEntryPath(manifest))) issues.push_back("entry-missing");
 
         ActiveEntryState active = inspectActiveEntry(manifest);
         if(active.present && !active.matchesSource) issues.push_back(active.conflict.empty() ? "active-entry-conflict" : active.conflict);
-        if(manifest.enabled && !active.matchesSource) issues.push_back("effective-disabled");
+        if(manifest.source != "runtime" && manifest.enabled && !active.matchesSource) issues.push_back("effective-disabled");
         if(!manifest.enabled && active.matchesSource) issues.push_back("effective-enabled-while-disabled");
 
         if(!manifest.requiresXovi.empty() && !versionSatisfies(XOVI_VERSION, manifest.requiresXovi)) {
@@ -905,7 +1086,10 @@ namespace {
 
         std::map<std::string, const ExtensionManifest *> byId;
         for(const auto &extension : inventory.extensions) {
-            if(extension.type == PACKAGE_EXTENSION) byId[extension.id] = &extension;
+            if(extension.type != PACKAGE_EXTENSION) continue;
+            byId[extension.id] = &extension;
+            const auto entry=fileName(extension.entry);
+            if(hasSuffix(entry,".so")) byId.emplace(entry.substr(0,entry.size()-3),&extension);
         }
         for(const auto &dependency : manifest.requiresExtensions) {
             auto found = byId.find(dependency.first);
@@ -914,7 +1098,9 @@ namespace {
                 continue;
             }
             if(!found->second->enabled) issues.push_back("disabled-dependency:" + dependency.first);
-            if(!versionSatisfies(found->second->version, dependency.second)) {
+            if(found->second->runtime.loadState>=XOVI_EXTENSION_DLOPEN_FAILED && found->second->runtime.loadState<=XOVI_EXTENSION_LINK_FAILED) issues.push_back("runtime-dependency-failed:"+dependency.first);
+            const auto version=found->second->runtime.version.empty() ? found->second->version : found->second->runtime.version;
+            if(version != "unknown" && !version.empty() && !versionSatisfies(version, dependency.second)) {
                 issues.push_back("dependency-version-incompatible:" + dependency.first);
             }
         }
@@ -962,16 +1148,12 @@ namespace {
         }
 
         if(manifest.type == PACKAGE_QMD && manifest.requiresExtensions.find("qt-resource-rebuilder") == manifest.requiresExtensions.end()) {
-            issues.push_back("missing-runtime-dependency:qt-resource-rebuilder");
-        }
-        if(manifest.type == PACKAGE_QMD) {
-            for(const auto &other : inventory.extensions) {
-                if(other.type != PACKAGE_QMD) continue;
-                if(other.id == manifest.id) continue;
-                if(other.order == manifest.order) {
-                    issues.push_back("qmd-order-conflict:" + other.id);
-                }
-            }
+            const auto found=byId.find("qt-resource-rebuilder");
+            if(found==byId.end() || !found->second->valid ||
+               (!isRegularFile(sourceEntryPath(*found->second)) && !found->second->runtime.seen))
+                issues.push_back("missing-runtime-dependency:qt-resource-rebuilder");
+            else if(!found->second->enabled) issues.push_back("disabled-dependency:qt-resource-rebuilder");
+            else if(found->second->runtime.loadState>=XOVI_EXTENSION_DLOPEN_FAILED && found->second->runtime.loadState<=XOVI_EXTENSION_LINK_FAILED) issues.push_back("runtime-dependency-failed:qt-resource-rebuilder");
         }
 
         if(manifest.type == PACKAGE_EXTENSION) {
@@ -1001,6 +1183,29 @@ namespace {
         return issues;
     }
 
+    std::vector<std::string> computeWarnings(const Inventory &inventory, const ExtensionManifest &manifest) {
+        auto warnings=manifest.warnings;
+        if(!manifest.managed) warnings.push_back("unmanaged");
+        if(!manifest.hasManifest) warnings.push_back("missing-manifest");
+        if(manifest.type==PACKAGE_QMD) {
+            for(const auto &other:inventory.extensions) {
+                if(other.type==PACKAGE_QMD && other.id!=manifest.id && other.order==manifest.order)
+                    warnings.push_back("qmd-order-conflict:"+other.id);
+            }
+        }
+        for(const auto &dependency:manifest.requiresExtensions) {
+            int index=findExtension(inventory,dependency.first);
+            if(index<0) index=findExtension(inventory,dependency.first+".so");
+            if(index<0) continue;
+            const auto &candidate=inventory.extensions[index];
+            const auto version=candidate.runtime.version.empty() ? candidate.version : candidate.runtime.version;
+            if(!dependency.second.empty() && (version.empty() || version=="unknown")) warnings.push_back("dependency-version-unknown:"+dependency.first);
+        }
+        std::sort(warnings.begin(),warnings.end());
+        warnings.erase(std::unique(warnings.begin(),warnings.end()),warnings.end());
+        return warnings;
+    }
+
     bool hasBlockingEnableIssue(const std::vector<std::string> &issues) {
         for(const std::string &issue : issues) {
             if(issue == "manifest-invalid" ||
@@ -1011,6 +1216,7 @@ namespace {
                 issue == "architecture-mismatch" ||
                 issue == "xochitl-version-incompatible" ||
                 issue == "missing-runtime-dependency:qt-resource-rebuilder" ||
+                issue.rfind("runtime-dependency-failed:", 0) == 0 ||
                 issue.rfind("missing-dependency:", 0) == 0 ||
                 issue.rfind("disabled-dependency:", 0) == 0 ||
                 issue.rfind("dependency-version-incompatible:", 0) == 0 ||
@@ -1026,6 +1232,7 @@ namespace {
     }
 
     bool requiresRestart(const ExtensionManifest &manifest) {
+        if(manifest.type == PACKAGE_QML || manifest.source == "runtime") return PENDING_RESTART_PACKAGES.count(manifest.id) != 0;
         bool active = effectiveEnabled(manifest);
         if(PENDING_RESTART_PACKAGES.find(manifest.id) != PENDING_RESTART_PACKAGES.end()) return true;
         if(manifest.type == PACKAGE_QMD) return manifest.enabled != active;
@@ -1067,6 +1274,7 @@ namespace {
                 return actions;
             }
             actions.push_back(manifest.enabled ? "disable" : "enable");
+            if(needsActiveRepair(manifest)) actions.push_back("repair");
             actions.push_back("remove");
             return actions;
         }
@@ -1125,6 +1333,7 @@ namespace {
         name = removeSuffix(name, ".zip");
         name = removeSuffix(name, ".so");
         name = removeSuffix(name, ".qmd");
+        name = removeSuffix(name, ".qml");
         return name;
     }
 
@@ -1224,6 +1433,7 @@ namespace {
 
     std::string targetDirForPackage(PackageType type, const std::string &id) {
         if(type == PACKAGE_QMD) return joinPath(qmdPackageRoot(), id);
+        if(type == PACKAGE_QML) return joinPath(joinPath(xoviRoot(), "qml.available"), id);
         return joinPath(extensionPackageRoot(), id);
     }
 
@@ -1393,6 +1603,7 @@ namespace {
     bool isActivePathForType(PackageType type, const std::string &path) {
         std::string parent = parentPath(path);
         if(type == PACKAGE_QMD) return parent == qmdActiveDir();
+        if(type == PACKAGE_QML) return parent == joinPath(xoviRoot(), "qml.d");
         if(type == PACKAGE_EXTENSION) return parent == joinPath(xoviRoot(), "extensions.d");
         return false;
     }
@@ -1400,6 +1611,7 @@ namespace {
     bool isLegacyDirectoryPath(PackageType type, const std::string &path) {
         if(path.empty() || !isDirectory(path) || isPathPresent(joinPath(path, "manifest.json"))) return false;
         if(type == PACKAGE_QMD) return parentPath(path) == qmdPackageRoot();
+        if(type == PACKAGE_QML) return parentPath(path) == joinPath(xoviRoot(), "qml.available");
         if(type == PACKAGE_EXTENSION) return parentPath(path) == extensionPackageRoot();
         return false;
     }
@@ -1444,6 +1656,18 @@ namespace {
 
     bool isSelfPackage(const ExtensionManifest &manifest) {
         return manifest.id == "xovi-extension-manager";
+    }
+
+    void setProviderSuppressed(const ExtensionManifest &manifest, bool suppressed) {
+        if(manifest.type != PACKAGE_EXTENSION && manifest.type != PACKAGE_QMD) return;
+        std::lock_guard<std::mutex> lock(PROVIDER_MUTEX);
+        for(auto name : {manifest.id, fileName(manifest.entry), fileName(enabledEntryPath(manifest))}) {
+            if(hasSuffix(name, ".so")) name.resize(name.size()-3);
+            else if(hasSuffix(name, ".qmd")) name.resize(name.size()-4);
+            const auto key=xoviRoot()+"/"+name;
+            if(suppressed) SUPPRESSED_PROVIDERS.insert(key);
+            else SUPPRESSED_PROVIDERS.erase(key);
+        }
     }
 
     bool disableLegacyActiveEntry(
@@ -1627,6 +1851,12 @@ namespace {
             plan.previousQmdActiveSymlink = previousActive.symlink;
         }
 
+        if(existing.type == PACKAGE_QML) {
+            ActiveEntryState previousActive = inspectActiveEntry(existing);
+            plan.previousQmdActivePath = enabledEntryPath(existing);
+            plan.previousQmdActiveMatchesSource = previousActive.matchesSource;
+            plan.previousQmdActiveSymlink = previousActive.symlink;
+        }
         plan.touchesActivePackage = effectiveEnabled(existing) || existing.runtime.loadState == XOVI_EXTENSION_INITIALIZED;
         if(existing.version == manifest.version) {
             plan.mode = "reinstall";
@@ -1662,7 +1892,7 @@ namespace {
         const InstallPlan &plan,
         std::vector<std::string> &actions
     ) {
-        if(manifest.type == PACKAGE_QMD) {
+        if(manifest.type == PACKAGE_QMD || manifest.type == PACKAGE_QML) {
             std::string currentActivePath = enabledEntryPath(manifest);
             if(plan.previousQmdActiveMatchesSource && plan.previousQmdActiveSymlink &&
                 !plan.previousQmdActivePath.empty() && isSymlink(plan.previousQmdActivePath)) {
@@ -1697,6 +1927,12 @@ namespace {
             actions.push_back("left-disabled-after-install");
         }
         if(plan.touchesActivePackage) markRestartPending(manifest);
+        // Existing QML URLs may still be cached in xochitl's shared engine.
+        // Never clear the application's global component cache behind its back.
+        if(manifest.type == PACKAGE_QML && plan.mode != "new") {
+            PENDING_RESTART = true;
+            PENDING_RESTART_PACKAGES.insert(manifest.id);
+        }
 
         Inventory after = loadInventory();
         int afterIndex = findExtension(after, manifest.id);
@@ -1729,7 +1965,7 @@ namespace {
         if(!isPathPresent(request.path)) return errorJson("not-found", "install path was not found");
 
         PackageType type = inferPackageType(request.path);
-        if(type == PACKAGE_UNKNOWN) return errorJson("unsupported-file", "single-file install supports .so and .qmd");
+        if(type == PACKAGE_UNKNOWN) return errorJson("unsupported-file", "single-file install supports .so, .qmd and .qml");
 
         std::string sourceName = fileName(request.path);
         std::string manifestPath = sidecarManifestPath(request.path);
@@ -1890,6 +2126,7 @@ std::string sourceEntryPath(const ExtensionManifest &manifest) {
 }
 
 std::string enabledEntryPath(const ExtensionManifest &manifest) {
+    if(manifest.type == PACKAGE_QML) return joinPath(joinPath(xoviRoot(), "qml.d"), manifest.id + ".qml");
     if(!manifest.enabledEntryPathOverride.empty()) return manifest.enabledEntryPathOverride;
     if(manifest.type == PACKAGE_QMD) {
         return joinPath(qmdActiveDir(), qmdActiveFileName(manifest));
@@ -1988,6 +2225,17 @@ Inventory loadInventory(bool includeRuntime) {
         closedir(activeQmd);
     }
 
+    std::string qmlRoot = joinPath(inventory.root, "qml.available");
+    DIR *qmlDir = opendir(qmlRoot.c_str());
+    if(qmlDir) {
+        while(auto *entry = readdir(qmlDir)) {
+            if(entry->d_name[0] == '.') continue;
+            std::string path = joinPath(qmlRoot, entry->d_name);
+            if(isDirectory(path) && isPathPresent(joinPath(path, "manifest.json")))
+                inventory.extensions.push_back(parseManifest(path, joinPath(path, "manifest.json"), PACKAGE_QML));
+        }
+        closedir(qmlDir);
+    }
     if(includeRuntime) attachRuntimeState(inventory);
 
     std::sort(inventory.extensions.begin(), inventory.extensions.end(), [](const ExtensionManifest &a, const ExtensionManifest &b) {
@@ -2022,6 +2270,8 @@ std::string extensionToJson(const Inventory &inventory, const ExtensionManifest 
     addStringField(out, first, "activeEntryConflict", active.conflict);
     addBoolField(out, first, "effectiveEnabled", active.matchesSource);
     addBoolField(out, first, "enabled", extension.enabled);
+    addBoolField(out, first, "activationNeedsRepair", needsActiveRepair(extension));
+    addStringField(out, first, "activationIssue", activationIssue(extension));
     addBoolField(out, first, "hasManifest", extension.hasManifest);
     addBoolField(out, first, "valid", extension.valid);
     addStringField(out, first, "directoryPath", extension.directoryPath);
@@ -2038,6 +2288,7 @@ std::string extensionToJson(const Inventory &inventory, const ExtensionManifest 
         << "}";
     addComma(out, first);
     out << "\"runtime\":{"
+        << "\"name\":\"" << jsonutil::escape(extension.runtime.name) << "\","
         << "\"seen\":" << boolValue(extension.runtime.seen) << ","
         << "\"loadState\":" << extension.runtime.loadState << ","
         << "\"loadStateName\":\"" << jsonutil::escape(extension.runtime.loadStateName) << "\","
@@ -2046,7 +2297,7 @@ std::string extensionToJson(const Inventory &inventory, const ExtensionManifest 
         << "}";
     addBoolField(out, first, "requiresRestart", requiresRestart(extension));
     addComma(out, first);
-    out << "\"warnings\":" << jsonutil::stringArray(extension.warnings);
+    out << "\"warnings\":" << jsonutil::stringArray(computeWarnings(inventory, extension));
     addComma(out, first);
     out << "\"errors\":" << jsonutil::stringArray(extension.errors);
     addComma(out, first);
@@ -2116,7 +2367,13 @@ std::string errorJson(const std::string &code, const std::string &message) {
     return "{\"ok\":false,\"error\":\"" + jsonutil::escape(code) + "\",\"message\":\"" + jsonutil::escape(message) + "\"}";
 }
 
+bool isSettingsProviderSuppressed(const std::string &runtimeName) {
+    std::lock_guard<std::mutex> lock(PROVIDER_MUTEX);
+    return SUPPRESSED_PROVIDERS.count(xoviRoot()+"/"+runtimeName) != 0;
+}
+
 std::string setExtensionEnabled(const std::string &id, bool enabled) {
+    std::lock_guard<std::mutex> operationLock(OPERATION_MUTEX);
     Inventory inventory = loadInventory();
     int index = findExtension(inventory, id);
     if(index < 0) return errorJson("not-found", "package was not found");
@@ -2151,13 +2408,14 @@ std::string setExtensionEnabled(const std::string &id, bool enabled) {
     if(!writeFile(extension.manifestPath, json, error)) return errorJson("write-failed", error);
 
     extension.enabled = enabled;
+    setProviderSuppressed(extension, !enabled);
     std::vector<std::string> actions;
     actions.push_back(enabled ? "manifest-enabled" : "manifest-disabled");
 
     std::string source = sourceEntryPath(extension);
     std::string active = enabledEntryPath(extension);
     if(enabled) {
-        std::string activeDir = extension.type == PACKAGE_QMD ? qmdActiveDir() : joinPath(xoviRoot(), "extensions.d");
+        std::string activeDir = parentPath(active);
         mkdirRecursive(activeDir);
         ActiveEntryState activeState = inspectActiveEntry(extension);
         if(activeState.present && activeState.matchesSource) {
@@ -2166,28 +2424,23 @@ std::string setExtensionEnabled(const std::string &id, bool enabled) {
             actions.push_back("active-entry-conflict");
         } else if(!isPathPresent(source)) {
             actions.push_back("source-entry-missing");
-        } else if(symlink(source.c_str(), active.c_str()) == 0) {
+        } else if(createRelativeSymlink(source, active, error)) {
             actions.push_back("active-entry-symlink-created");
             markRestartPending(extension);
         } else {
-            actions.push_back(std::string("active-entry-symlink-failed:") + std::strerror(errno));
-        }
-    } else if(isPathPresent(active)) {
-        ActiveEntryState activeState = inspectActiveEntry(extension);
-        if(activeState.present && !activeState.matchesSource) {
-            actions.push_back("active-entry-conflict-left-in-place");
-        } else if(isSymlink(active)) {
-            if(unlink(active.c_str()) == 0) {
-                actions.push_back("active-entry-symlink-removed");
-                markRestartPending(extension);
-            } else {
-                actions.push_back(std::string("active-entry-remove-failed:") + std::strerror(errno));
-            }
-        } else {
-            actions.push_back("active-entry-not-symlink-left-in-place");
+            actions.push_back(std::string("active-entry-symlink-failed:") + error);
         }
     } else {
-        actions.push_back("active-entry-already-absent");
+        std::vector<std::string> paths = staleActivePaths(extension);
+        if(isPathPresent(active)) paths.insert(paths.begin(), active);
+        for(const auto &path : paths) {
+            if(!isSymlink(path) || unlink(path.c_str()) != 0) {
+                return "{\"ok\":false,\"error\":\"activation-cleanup-failed\",\"message\":\"Disabled, but an active entry could not be removed; regular files are preserved\",\"enabled\":false,\"partialActions\":" + jsonutil::stringArray(actions) + "}";
+            }
+            actions.push_back("active-entry-symlink-removed");
+            markRestartPending(extension);
+        }
+        if(paths.empty()) actions.push_back("active-entry-already-absent");
     }
 
     Inventory after = loadInventory();
@@ -2207,18 +2460,98 @@ std::string setExtensionEnabled(const std::string &id, bool enabled) {
     return out.str();
 }
 
+std::string repairExtensionActiveState(const std::string &id) {
+    std::lock_guard<std::mutex> operationLock(OPERATION_MUTEX);
+    Inventory inventory = loadInventory();
+    int index = findExtension(inventory, id);
+    if(index < 0) return errorJson("not-found", "package was not found");
+    ExtensionManifest &extension = inventory.extensions[static_cast<size_t>(index)];
+    if(!extension.managed || !extension.hasManifest) return errorJson("missing-manifest", "repair requires a managed package manifest");
+    if(!extension.valid) return errorJson("invalid-manifest", "package manifest must be fixed before repair");
+
+    const std::string source = sourceEntryPath(extension);
+    const std::string active = enabledEntryPath(extension);
+    ActiveEntryState activeState = inspectActiveEntry(extension);
+    std::vector<std::string> actions;
+    std::string error;
+    auto partialFailure = [&](const std::string &message) {
+        return "{\"ok\":false,\"error\":\"active-entry-repair-failed\",\"message\":\"" + jsonutil::escape(message) +
+            "\",\"partialActions\":" + jsonutil::stringArray(actions) +
+            ",\"requiresRestart\":" + boolValue(extension.type != PACKAGE_QML && !actions.empty()) +
+            ",\"restartTarget\":\"xochitl\"}";
+    };
+
+    if(extension.enabled) {
+        std::vector<std::string> issues = computeIssues(inventory, extension);
+        issues.erase(std::remove(issues.begin(), issues.end(), "active-entry-conflict"), issues.end());
+        issues.erase(std::remove(issues.begin(), issues.end(), "active-entry-unreadable"), issues.end());
+        issues.erase(std::remove(issues.begin(), issues.end(), "effective-disabled"), issues.end());
+        if(hasBlockingEnableIssue(issues)) {
+            return "{\"ok\":false,\"error\":\"repair-blocked\",\"message\":\"package has blocking issues\",\"issues\":" + jsonutil::stringArray(issues) + "}";
+        }
+        if(!isRegularFile(source)) return errorJson("source-entry-missing", "package source entry is missing");
+        if(!mkdirRecursive(parentPath(active))) return errorJson("active-directory-failed", "cannot create active entry directory");
+        if(activeState.present && !activeState.symlink) {
+            return errorJson("active-entry-conflict", "active entry is not a symlink and was left in place");
+        }
+        bool activationChanged = !activeState.matchesSource;
+        if(activeState.present) {
+            if(!replaceSymlinkWithRelativeTarget(source, active, error)) return errorJson("active-entry-repair-failed", error);
+            actions.push_back(activeState.matchesSource ? "active-entry-symlink-normalized-relative" : "active-entry-symlink-replaced");
+        } else {
+            if(!createRelativeSymlink(source, active, error)) return errorJson("active-entry-repair-failed", error);
+            actions.push_back("active-entry-symlink-created");
+        }
+        if(activationChanged) markRestartPending(extension);
+        for(const std::string &stale : staleActivePaths(extension)) {
+            if(unlink(stale.c_str()) != 0) return partialFailure(std::strerror(errno));
+            actions.push_back(extension.type == PACKAGE_QMD ? "stale-qmd-active-symlink-removed" : "stale-active-symlink-removed");
+            markRestartPending(extension);
+        }
+    } else {
+        if(isSelfPackage(extension)) return errorJson("self-disable-blocked", "xovi-extension-manager cannot disable itself");
+        if(extension.type == PACKAGE_QMD) {
+            std::vector<std::string> issues = qmdRequiredByIssues(inventory, extension);
+            if(!issues.empty()) {
+                return "{\"ok\":false,\"error\":\"qmd-required-by\",\"message\":\"QMD package is required by enabled consumers\",\"issues\":" + jsonutil::stringArray(issues) + "}";
+            }
+        }
+        if(activeState.present) {
+            if(!activeState.symlink) return errorJson("active-entry-conflict", "active entry is not a symlink and was left in place");
+            if(unlink(active.c_str()) != 0) return errorJson("active-entry-repair-failed", std::strerror(errno));
+            actions.push_back("active-entry-symlink-removed");
+            markRestartPending(extension);
+        }
+        for(const std::string &stale : staleActivePaths(extension)) {
+            if(unlink(stale.c_str()) != 0) return partialFailure(std::strerror(errno));
+            actions.push_back(extension.type == PACKAGE_QMD ? "stale-qmd-active-symlink-removed" : "stale-active-symlink-removed");
+            markRestartPending(extension);
+        }
+        if(actions.empty()) actions.push_back("active-entry-already-absent");
+    }
+
+    Inventory after = loadInventory();
+    int afterIndex = findExtension(after, extension.id);
+    if(afterIndex < 0) return errorJson("not-found", "package disappeared during repair");
+    const ExtensionManifest &repaired = after.extensions[static_cast<size_t>(afterIndex)];
+    return "{\"ok\":true,\"type\":\"" + jsonutil::escape(repaired.typeName) + "\",\"id\":\"" + jsonutil::escape(repaired.id) +
+        "\",\"enabled\":" + boolValue(repaired.enabled) + ",\"effectiveEnabled\":" + boolValue(effectiveEnabled(repaired)) +
+        ",\"actions\":" + jsonutil::stringArray(actions) + ",\"issues\":" + jsonutil::stringArray(computeIssues(after, repaired)) +
+        ",\"requiresRestart\":" + boolValue(requiresRestart(repaired)) + ",\"restartTarget\":\"xochitl\",\"extension\":" + extensionToJson(after, repaired) + "}";
+}
+
 std::string installPackage(const std::string &request) {
     InstallRequest parsed = parseInstallRequest(request);
     if(parsed.path.empty()) return errorJson("missing-path", "install request requires a path");
     if(!isPathPresent(parsed.path)) return errorJson("not-found", "install path was not found");
 
-    if(hasSuffix(parsed.path, ".so") || hasSuffix(parsed.path, ".qmd")) {
+    if(hasSuffix(parsed.path, ".so") || hasSuffix(parsed.path, ".qmd") || hasSuffix(parsed.path, ".qml")) {
         return installSingleFile(parsed);
     }
     if(hasSuffix(parsed.path, ".tar.gz") || hasSuffix(parsed.path, ".tgz") || hasSuffix(parsed.path, ".zip")) {
         return installArchive(parsed);
     }
-    return errorJson("unsupported-package", "install supports .so, .qmd, .tar.gz, .tgz, and .zip");
+    return errorJson("unsupported-package", "install supports .so, .qmd, .qml, .tar.gz, .tgz, and .zip");
 }
 
 std::string adoptLegacyPackage(const std::string &request) {
@@ -2393,6 +2726,7 @@ std::string disableLegacyPackage(const std::string &request) {
     if(!disableLegacyActiveEntry(legacy, actions, preservedPath, error)) {
         return errorJson("disable-legacy-failed", error);
     }
+    setProviderSuppressed(legacy, true);
     bool changed = std::find(actions.begin(), actions.end(), "legacy-active-entry-already-absent") == actions.end();
 
     std::ostringstream out;
@@ -2473,6 +2807,7 @@ std::string removeManagedPackage(const std::string &request) {
             << "\"restartTarget\":\"xochitl\","
             << "\"package\":" << removedPackage << ","
             << "\"extension\":" << removedPackage << "}";
+        setProviderSuppressed(package, true);
         return out.str();
     }
     if(isSelfPackage(package)) return errorJson("self-remove-blocked", "xovi-extension-manager cannot remove itself");
@@ -2491,7 +2826,7 @@ std::string removeManagedPackage(const std::string &request) {
     if(active.present && !active.matchesSource) return errorJson("active-entry-conflict", "active entry points somewhere else");
 
     std::vector<std::string> actions;
-    bool restart = requiresRestart(package) || active.present;
+    bool restart = package.type != PACKAGE_QML && (requiresRestart(package) || active.present);
     std::string activePath = enabledEntryPath(package);
     if(active.present) {
         if(unlink(activePath.c_str()) != 0) {
@@ -2519,6 +2854,7 @@ std::string removeManagedPackage(const std::string &request) {
         << "\"restartTarget\":\"xochitl\","
         << "\"package\":" << removedPackage << ","
         << "\"extension\":" << removedPackage << "}";
+    setProviderSuppressed(package, true);
     return out.str();
 }
 
@@ -2547,17 +2883,30 @@ std::string requiresRestartJson() {
         ",\"restartTarget\":\"xochitl\",\"pendingPackages\":" + pending.str() + "}";
 }
 
+std::string reconcileDisabledEntries() {
+    const auto inventory = loadInventory(false);
+    std::string results = "[";
+    for(const auto &p : inventory.extensions) {
+        if(!p.managed || !p.hasManifest || !p.valid || p.enabled || isSelfPackage(p)) continue;
+        if(!isPathPresent(enabledEntryPath(p)) && staleActivePaths(p).empty()) continue;
+        if(results.size() > 1) results += ",";
+        results += repairExtensionActiveState(p.id);
+    }
+    return results + "]";
+}
+
 void scanDependenciesAtStartup() {
-    Inventory inventory = loadInventory(false);
+    Inventory inventory = loadInventory();
     int blockingCount = 0;
     int warningCount = 0;
     for(const ExtensionManifest &extension : inventory.extensions) {
         std::vector<std::string> issues = computeIssues(inventory, extension);
-        if(issues.empty()) continue;
+        const auto warnings=computeWarnings(inventory,extension);
+        if(issues.empty() && warnings.empty()) continue;
 
         bool blocking = extension.enabled && hasBlockingEnableIssue(issues);
         bool qmdOrderWarning = false;
-        for(const std::string &issue : issues) {
+        for(const std::string &issue : warnings) {
             if(issue.rfind("qmd-order-conflict:", 0) == 0) qmdOrderWarning = true;
         }
         if(!blocking && !qmdOrderWarning) continue;
@@ -2566,10 +2915,11 @@ void scanDependenciesAtStartup() {
         if(qmdOrderWarning) ++warningCount;
         std::fprintf(
             stderr,
-            "[xovi-extension-manager] startup dependency scan: %s package %s has issues %s\n",
+            "[xovi-extension-manager] startup dependency scan: %s package %s has %s %s\n",
             blocking ? "enabled" : "qmd",
             extension.id.c_str(),
-            jsonutil::stringArray(issues).c_str()
+            blocking ? "errors" : "warnings",
+            jsonutil::stringArray(blocking ? issues : warnings).c_str()
         );
     }
     if(blockingCount > 0 || warningCount > 0) {
@@ -2587,7 +2937,7 @@ std::string schemaJson() {
         "\"ok\":true,"
         "\"manifestFiles\":{"
             "\"extension\":\"/home/root/xovi/extensions.available/<id>/manifest.json\","
-            "\"qmd\":\"/home/root/xovi/qmd.available/<id>/manifest.json\""
+            "\"qml\":\"/home/root/xovi/qml.available/<id>/manifest.json\",\"qmd\":\"/home/root/xovi/qmd.available/<id>/manifest.json\""
         "},"
         "\"packageFiles\":{"
             "\"extension\":\"/home/root/xovi/extensions.available/<id>/<entry>\","
@@ -2597,15 +2947,16 @@ std::string schemaJson() {
             "\"extension\":\"/home/root/xovi/exthome/<id>\","
             "\"qmd\":\"/home/root/xovi/exthome/<id>\""
         "},"
-        "\"installSupports\":[\".so\",\".qmd\",\".tar.gz\",\".tgz\",\".zip\"],"
+        "\"installSupports\":[\".so\",\".qmd\",\".qml\",\".tar.gz\",\".tgz\",\".zip\"],"
         "\"legacySupports\":[\"active .so in extensions.d\",\"active .qmd in exthome/qt-resource-rebuilder\"],"
         "\"actions\":{"
             "\"adopt\":\"copy a legacy active file into the managed layout and create manifest.json\","
             "\"disableLegacy\":\"remove a legacy active symlink or move a legacy active file into legacy-disabled\","
+            "\"repair\":\"reconcile active symlinks with manifest.enabled using relative targets\","
             "\"remove\":\"remove a managed package or move legacy files/directories into legacy-disabled\""
         "},"
         "\"required\":[\"id\"],"
-        "\"xochitlVersionMatching\":\"exact string unless an entry contains *, where * matches any sequence; a single * matches any detected xochitl version\","
+        "\"xochitlVersionMatching\":\"exact string, or lowercase x as a complete dot-delimited segment with the same segment count; legacy * matches any sequence and a single * matches any detected xochitl version\","
         "\"defaults\":{"
             "\"manifestVersion\":1,"
             "\"type\":\"inferred from entry suffix\","
@@ -2630,7 +2981,7 @@ std::string schemaJson() {
             "\"requires\":{"
                 "\"xovi\":\">=0.3.0\","
                 "\"extensions\":{\"qt-resource-rebuilder\":\">=0.3.0\"},"
-                "\"xochitl\":[\"3.27.*\",\"3.28.*\"],"
+                "\"xochitl\":[\"3.27.x.x\",\"3.28.x.x\"],"
                 "\"architectures\":[\"aarch64\"]"
             "},"
             "\"entry\":\"advanced-settings.so\","
@@ -2646,7 +2997,7 @@ std::string schemaJson() {
             "\"requires\":{"
                 "\"extensions\":{\"qt-resource-rebuilder\":\">=0.3.0\"},"
                 "\"qmd\":{\"scroll-screen-up-or-down\":\">=0.1.2\"},"
-                "\"xochitl\":[\"3.28.*\"],"
+                "\"xochitl\":[\"3.28.x.x\"],"
                 "\"architectures\":[\"aarch64\"]"
             "},"
             "\"entry\":\"HideDevIcon.qmd\","

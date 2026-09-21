@@ -1,4 +1,7 @@
 [submodule "xovi"]
 	path = xovi
-	url = git@github.com:Zen-Ink/xovi.git
+	url = https://github.com/Zen-Ink/xovi.git
 	branch = master
+[submodule "sdk"]
+	path = sdk
+	url = https://github.com/Zen-Ink/xovi-extension-manager-sdk.git

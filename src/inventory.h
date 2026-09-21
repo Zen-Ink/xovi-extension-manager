@@ -7,10 +7,12 @@
 enum PackageType {
     PACKAGE_EXTENSION,
     PACKAGE_QMD,
+    PACKAGE_QML,
     PACKAGE_UNKNOWN,
 };
 
 struct RuntimeState {
+    std::string name;
     bool seen = false;
     int loadState = -1;
     std::string loadStateName = "not-scanned";
@@ -66,11 +68,14 @@ std::string inventoryToJson(const Inventory &inventory);
 std::string extensionToJson(const Inventory &inventory, const ExtensionManifest &extension);
 int findExtension(const Inventory &inventory, const std::string &id);
 std::string setExtensionEnabled(const std::string &id, bool enabled);
+std::string repairExtensionActiveState(const std::string &id);
 std::string installPackage(const std::string &request);
 std::string adoptLegacyPackage(const std::string &request);
 std::string disableLegacyPackage(const std::string &request);
 std::string removeManagedPackage(const std::string &request);
 std::string requiresRestartJson();
 void scanDependenciesAtStartup();
+std::string reconcileDisabledEntries();
+bool isSettingsProviderSuppressed(const std::string &runtimeName);
 std::string schemaJson();
 std::string errorJson(const std::string &code, const std::string &message);

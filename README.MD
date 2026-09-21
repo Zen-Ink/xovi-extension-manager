@@ -50,6 +50,12 @@ user-created state. Reinstall, upgrade, and remove operate on `*.available`
 package directories and do not delete `exthome/<id>` unless a future explicit
 purge operation is added.
 
+For xochitl compatibility, prefer complete dot-segment wildcards such as
+`"xochitl": ["3.27.x.x", "3.28.x.x"]`. Lowercase `x` must occupy a complete
+segment and the required and detected versions must have the same number of
+segments. Exact versions remain supported. The legacy `*` wildcard syntax is
+also retained for existing packages.
+
 ## Broker API
 
 The manager exports these signals through `xovi-message-broker`:
@@ -89,3 +95,27 @@ For full request/response formats and error codes, see
   rules.
 - [`docs/xovi-extension-manager-state-model.md`](docs/xovi-extension-manager-state-model.md):
   runtime load states, disk state, issues, and recommended operations.
+
+## Unified settings (0.2)
+
+Native plugins can export a C settings provider tagged with XOVI metadata and
+embed QML using `.xovi resource`; a settings manifest entry is optional. Pure
+QML packages use `type: "qml"`, a QML `entry`, and the `qml.available` / `qml.d`
+layout. The optional `xovi-extension-manager-ui` supplies the settings sidebar
+entry and lazy page host.
+
+See [the provider/API guide](docs/settings-provider-api.md) for settings storage,
+injection policy, status semantics, SDK headers and examples. No form schema is
+required. `settingsList`, `settingsGet`, `settingsUpdate`, `injectionsGet`,
+`injectionsSet` and `uiReport` supplement the existing broker commands.
+
+## Checkout dependencies
+
+Clone with `git clone --recurse-submodules`, or run
+`git submodule update --init --recursive` after pulling. The `sdk` submodule
+pins the shared settings, navigation, notifications and QML controls API.
+The `xovi` submodule supplies the binding generator; `XOVI_REPO` can override it.
+
+Standalone build: `TOOLCHAIN_ROOT=/path/to/toolchian ./build.sh all`.
+The toolchain root contains the `rmpp` and `rm2` SDK environment scripts;
+libraries and manifests are copied to `build/<arch>/`.

@@ -166,7 +166,7 @@ QMD packages should declare:
       "qt-resource-rebuilder": ">=0.3.0"
     },
     "qmd": {},
-    "xochitl": ["3.28.0.162"],
+    "xochitl": ["3.28.x.x"],
     "architectures": ["aarch64"]
   }
 }
@@ -197,7 +197,7 @@ filename as its `entry`:
       "qt-resource-rebuilder": ">=0.3.0"
     },
     "qmd": {},
-    "xochitl": ["3.28.0.162", "3.28.0.163", "3.28.0.164"],
+    "xochitl": ["3.28.x.x"],
     "architectures": []
   }
 }
@@ -222,7 +222,7 @@ The consuming package declares the relationship and uses a later order:
     "qmd": {
       "scroll-screen-up-or-down": ">=0.1.2"
     },
-    "xochitl": ["3.28.0.162", "3.28.0.163", "3.28.0.164"],
+    "xochitl": ["3.28.x.x"],
     "architectures": []
   }
 }
@@ -273,12 +273,24 @@ The manager scans QMD packages from
 | `requires.xovi` | string | Compared with the compiled XOVI API version. Supported operators are `>=`, `>`, `=`, or exact semver. Missing values add `missing-requires.xovi`. |
 | `requires.extensions` | object of extension id to version requirement | Hard dependencies on XOVI `.so` extension packages. QMD package ids must not be placed here. |
 | `requires.qmd` | object of QMD package id to version requirement | Hard dependencies on managed QMD packages. Enable requires each dependency to be valid, version-compatible, effectively enabled, acyclic, and ordered before the consumer. |
-| `requires.xochitl` | string array | If non-empty and the current xochitl version is known, at least one entry must match. Entries without `*` match exactly; entries with `*` use simple wildcard matching, so `3.28.*` matches all `3.28` releases and `*` matches any known xochitl version. |
+| `requires.xochitl` | string array | If non-empty and the current xochitl version is known, at least one entry must match. Prefer lowercase `x` as a complete dot-delimited segment, such as `3.28.x.x`; the pattern and detected version must have the same number of segments. Exact versions remain supported. For compatibility with existing packages, `*` retains its simple character-level wildcard behavior and a single `*` matches any known xochitl version. |
 | `requires.architectures` | string array | If non-empty and the current architecture is known, at least one entry must match. `aarch64` and `arm64` are treated as aliases. |
 | Other keys | any | Ignored by the current manager unless future code adds support. `xovigen.py` may emit `homepage` and `source`, but they are not returned by the current broker responses. Legacy top-level fields such as `xoviApi`, `dependencies`, `xochitlVersions`, and top-level `architectures` are ignored; use the `requires` object instead. |
+
+The manager does not infer or prepend any implicit payload directory. If the
+entry file is stored under a subdirectory, include that subdirectory in
+`manifest.entry`, for example `package/framebuffer-spy.so`. Alternatively, a
+package may provide `manifest.entry` as a symlink that resolves to the real
+entry file; the manager treats the active entry as matching when both paths
+resolve to the same file.
 
 Dependency and compatibility failures are reported through each package's `issues` array. `enable` rejects packages with blocking issues such as invalid manifest, missing entry, incompatible XOVI/xochitl/architecture, active symlink conflict, missing dependency, disabled dependency, or incompatible dependency
 version.
 
 The same `requires.xochitl` matching rules apply to extension and QMD packages.
-For example, `["3.28.*"]` accepts `3.28.0.162` and `3.28.0.163`, while `["*"]` means the package declares no xochitl version restriction as long as the current version can be detected. Empty strings do not match.
+For example, `["3.27.x.x", "3.28.x.x"]` accepts four-segment releases such as
+`3.27.0.100` and `3.28.0.163`, but does not accept `3.28.0` because the segment
+count differs. Lowercase `x` is special only when the whole segment is exactly
+`x`; forms such as `3.28.0.16x` do not match as wildcards. Exact strings still
+match, while `["*"]` means the package declares no xochitl version restriction
+as long as the current version can be detected. Empty strings do not match.

@@ -1,4 +1,4 @@
-version 0.1.0
+version 0.2.0
 
 condition getScannedExtensionCount
 
@@ -11,6 +11,7 @@ global-meta
     requiresXovi = ">=0.3.0"
     requiresExtensions = "xovi-message-broker:>=0.2.0"
     architectures = "aarch64,arm"
+    xochitlVersions = "3.27.x.x,3.28.x.x"
     entry = "xovi-extension-manager.so"
 end
 
@@ -36,6 +37,12 @@ export xovi_extension_manager_disable
 with
     xovi-message-broker$version = 1
     xovi-message-broker$simpleSignal = "xovi-extension-manager$disable"
+end
+
+export xovi_extension_manager_repair
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$repair"
 end
 
 export xovi_extension_manager_install
@@ -78,4 +85,116 @@ export xovi_extension_manager_health
 with
     xovi-message-broker$version = 1
     xovi-message-broker$simpleSignal = "xovi-extension-manager$health"
+end
+
+export xem_settingsList
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$settingsList"
+end
+
+export xem_settingsGet
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$settingsGet"
+end
+
+export xem_settingsUpdate
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$settingsUpdate"
+end
+
+export xem_injectionsGet
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$injectionsGet"
+end
+
+export xem_injectionsSet
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$injectionsSet"
+end
+
+export xem_uiReport
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$uiReport"
+end
+
+export xem_launcherList
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$launcherList"
+end
+
+export xem_launcherSet
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$launcherSet"
+end
+
+export xem_notificationsPost
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsPost"
+end
+
+export xem_notificationsList
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsList"
+end
+
+export xem_notificationsRead
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsRead"
+end
+
+export xem_notificationsDismiss
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsDismiss"
+end
+
+export xem_notificationsClear
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsClear"
+end
+
+export xem_notifications_get_api_v1
+with
+    xovi-extension-manager$notificationsApi = 1
+end
+
+export xem_notificationsActionInvoke
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsActionInvoke"
+end
+
+export xem_notificationsPollActions
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsPollActions"
+end
+
+export xem_notifications_get_api_v2
+with
+    xovi-extension-manager$notificationsApiV2 = 2
+end
+
+export xem_settingsRegister
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$settingsRegister"
+end
+
+export xem_settingsUnregister
+with
+    xovi-message-broker$version = 1
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$settingsUnregister"
 end
