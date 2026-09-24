@@ -106,4 +106,4 @@ extern "C" char *xem_notificationsDismiss(const char *value) { return brokerResp
 extern "C" char *xem_notificationsClear(const char *value) { return brokerResponse(notificationCommand("clear", value)); }
 
 extern "C" char *xem_notificationsActionInvoke(const char *value) { return brokerResponse(notificationCommand("actionInvoke", value)); }
-extern "C" char *xem_notificationsPollActions(const char *value) { return brokerResponse(notificationCommand("pollActions", value)); }
+extern "C" char *xem_notificationsAcknowledge(const char *value) { return brokerResponse(notificationCommand("acknowledge", value)); }

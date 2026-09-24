@@ -110,9 +110,11 @@ and cannot be isolated by asynchronous QML loading.
 | `sendPluginSignal(signal, text)` | Call `<pluginId>$<signal>` through native broker. |
 | `close()` | Return to the package list. |
 | `notify(object)` | Queue a session notification owned by this plugin. |
-| `notificationActionsEnabled` | Enable owner-bound action polling while the context is alive. Posting actions enables it. |
+| `notificationActionsEnabled` | Subscribe to owner-bound action/state events while the context is alive. Posting actions enables it. |
 | `notificationAction(action)` | Signal carrying one queued action; start work asynchronously. |
-| `takeNotificationActions()` | Manually take pending actions for this owner. |
+| `notificationState()` | Query entries and queued/delivered/completed/failed actions without consuming them. |
+| `notificationStateChanged()` | Signal: query a new snapshot after a store change. |
+| `completeNotificationAction(actionSequence, success, result)` | Explicitly acknowledge completion or failure; delivery alone is not success. |
 | `dismissNotification(key)` | Dismiss this plugin’s notification by key. |
 | `systemNavigationAvailable` | Whether the host currently supplies system navigation; updates live. |
 | `openSystemSettings(target)` | Open `wifi` or `language` using the host adapter. Returns `{ok:true,state:"dispatched"}` or `{ok:false,error:...}`. |

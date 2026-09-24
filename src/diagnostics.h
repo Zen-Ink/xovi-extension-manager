@@ -55,12 +55,22 @@ inline Diagnostic classify(const std::string &code, const std::string &detail={}
         set("concurrency","refresh-retry","Settings or requested content have changed or are busy.","Refresh and try again after the current operation finishes.","warning",true);
     } else if(oneOf(key,"self-disable-blocked|self-remove-blocked|last-manager-entry")) {
         set("protection","keep-entry","This operation would remove access to the manager.","Keep a working manager entry enabled.","warning");
-    } else if(oneOf(key,"ui-not-ready|manager-unavailable|rebuilder-unavailable|snapshot-unavailable|navigation-unavailable")) {
+    } else if(oneOf(key,"ui-not-ready|manager-unavailable|rebuilder-unavailable|snapshot-unavailable|navigation-unavailable|notification-subscription-unavailable")) {
         set("availability","check-service","A required service is not ready or unavailable.","Wait for initialization or check whether the service loaded.","warning",true);
-    } else if(oneOf(key,"page-not-found|page-unavailable|not-found|launcher-entry-not-found|action-not-available")) {
+    } else if(oneOf(key,"page-not-found|page-unavailable|not-found|launcher-entry-not-found|action-not-available|action-not-found|service-not-found|connection-not-found")) {
         set("availability","refresh","The requested item is unavailable.","Refresh and check whether the plugin or page is enabled.","warning",true);
-    } else if(oneOf(key,"component-limit|registration-limit|status-limit|action-queue-full|revision-exhausted")) {
+    } else if(oneOf(key,"component-limit|registration-limit|status-limit|action-queue-full|revision-exhausted|service-limit")) {
         set("capacity","check-plugin","A service limit has been reached.","Release unused registrations or queued actions and check the plugin.");
+    } else if(oneOf(key,"application-thread-required|wrong-process|action-not-delivered|service-already-registered")) {
+        set("request","check-plugin","The API call does not match its lifecycle requirements.","Check the application thread, process, registration and action state.");
+    } else if(oneOf(key,"socket-in-use")) {
+        set("concurrency","check-service","The socket address is already in use.","Use another service ID or stop the existing service; do not remove its socket.","warning");
+    } else if(oneOf(key,"runtime-directory-unavailable|unsafe-runtime-directory|unsafe-socket-path|stale-socket-cleanup-failed|socket-path-unavailable")) {
+        set("filesystem","check-files","The socket path cannot be used safely.","Check directory ownership, permissions and conflicting files.");
+    } else if(oneOf(key,"socket-unavailable|listen-failed|socket-write-failed|slow-client")) {
+        set("transport","check-client","Socket communication failed.","Check the client and system resources, then reconnect and query current state.","warning",true);
+    } else if(key=="socket-path-too-long") {
+        set("request","correct-request","The socket path is too long.","Use shorter owner and service IDs.");
     } else if(oneOf(key,"action-already-pending")) {
         set("concurrency","wait","The action is already pending.","Wait for the plugin to finish handling it.","info");
     } else if(oneOf(key,"invalid-settings-file|invalid-launcher-file|invalid-policy-file|policy-invalid")) {

@@ -1,4 +1,4 @@
-version 0.2.0
+version 0.3.0
 
 condition getScannedExtensionCount
 
@@ -165,9 +165,9 @@ with
     xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsClear"
 end
 
-export xem_notifications_get_api_v1
+export xem_notifications_get_api
 with
-    xovi-extension-manager$notificationsApi = 1
+    xovi-extension-manager$notificationsApi = 3
 end
 
 export xem_notificationsActionInvoke
@@ -176,16 +176,12 @@ with
     xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsActionInvoke"
 end
 
-export xem_notificationsPollActions
+export xem_notificationsAcknowledge
 with
     xovi-message-broker$version = 1
-    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsPollActions"
+    xovi-message-broker$simpleSignal = "xovi-extension-manager$notificationsAcknowledge"
 end
 
-export xem_notifications_get_api_v2
-with
-    xovi-extension-manager$notificationsApiV2 = 2
-end
 
 export xem_settingsRegister
 with
@@ -197,4 +193,9 @@ export xem_settingsUnregister
 with
     xovi-message-broker$version = 1
     xovi-message-broker$simpleSignal = "xovi-extension-manager$settingsUnregister"
+end
+
+export xem_sockets_get_api
+with
+    xovi-extension-manager$socketsApi = 1
 end

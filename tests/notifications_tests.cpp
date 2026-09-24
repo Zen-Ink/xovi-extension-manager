@@ -1,6 +1,9 @@
 #include "../src/notifications.h"
 #include "../sdk/xovi-notifications.h"
 
+#include <QCoreApplication>
+#include <QThread>
+#include <thread>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -35,7 +38,20 @@ QJsonObject post(const QString &id, const QString &message = "Message") {
 }
 }
 
-int main() {
+int main(int argc, char **argv) {
+    QCoreApplication app(argc,argv);
+    const auto *api=xem_notifications_get_api();
+    QJsonArray received;
+    const auto callback=+[](const char *text,void *data) {
+        auto event=QJsonDocument::fromJson(text).object();
+        expect(QThread::currentThread()==QCoreApplication::instance()->thread(), "callback runs on application thread");
+        // A callback can query synchronously without taking a recursive lock.
+        command("list");
+        if(event.value("type")=="action") static_cast<QJsonArray *>(data)->append(event.value("action"));
+    };
+    const auto subscription=api->subscribe("plugin_one",callback,&received);
+    expect(subscription!=0,"owner subscribes");
+    expect(!api->subscribe("plugin_one",callback,&received),"duplicate action subscriber rejected");
     const auto first = post("sync");
     expect(first.value("ok").toBool(), "post succeeds");
     expect(first.value("status").toString() == "queued", "post only reports queued");
@@ -93,18 +109,24 @@ int main() {
            "duplicate action click is rejected while pending");
     expect(command("list", {{"ownerId", "plugin_one"}}).value("entries").toArray().first().toObject().value("pendingActionIds").toArray().contains("cancel"),
            "pending action is exposed on entry");
-    expect(command("pollActions", {{"ownerId", "other_plugin"}}).value("actions").toArray().isEmpty(), "actions stay scoped to owner");
-    const auto delivered = command("pollActions", {{"ownerId", "plugin_one"}});
-    expect(delivered.value("actions").toArray().size() == 1 && delivered.value("actions").toArray().first().toObject().value("actionId").toString() == "cancel",
-           "owner atomically receives queued action");
-    expect(command("list", {{"ownerId", "plugin_one"}}).value("entries").toArray().first().toObject().value("pendingActionIds").toArray().isEmpty(),
-           "poll re-enables action after delivery");
+    expect(command("list", {{"ownerId", "other_plugin"}}).value("actions").toArray().isEmpty(), "query is owner scoped");
+    expect(received.isEmpty(),"action is not delivered inline");
+    QCoreApplication::processEvents();
+    expect(received.size()==1 && received.first().toObject().value("actionId")=="cancel", "subscription receives queued action");
+    const auto actionSequence=received.first().toObject().value("actionSequence");
+    expect(command("list", {{"ownerId", "plugin_one"}}).value("actions").toArray().first().toObject().value("status")=="delivered", "query retains delivered action");
+    expect(!command("actionInvoke", {{"ownerId","plugin_one"},{"notificationId","job"},{"actionId","cancel"}}).value("ok").toBool(),"delivery does not re-enable action");
+    const QJsonObject acknowledgment{{"ownerId","plugin_one"},{"actionSequence",actionSequence},{"status","completed"}};
+    expect(command("acknowledge",acknowledgment).value("ok").toBool(),"plugin explicitly acknowledges completion");
+    expect(command("acknowledge",acknowledgment).value("ok").toBool(),"acknowledgment is idempotent");
+    expect(command("list", {{"ownerId", "plugin_one"}}).value("entries").toArray().first().toObject().value("pendingActionIds").toArray().isEmpty(),"completion re-enables action");
+    expect(command("list", {{"ownerId", "plugin_one"}}).value("actions").toArray().size()==1,"query does not consume action history");
     expect(command("actionInvoke", {{"ownerId", "plugin_one"}, {"notificationId", "job"},
                                       {"actionId", "cancel"}, {"sequence", runningSequence}}).value("ok").toBool(),
-           "action can be queued again after delivery");
+           "action can be queued again after completion");
     expect(command("dismiss", {{"ownerId", "plugin_one"}, {"notificationId", "job"}}).value("ok").toBool(),
            "dismiss clears notification with a pending action");
-    expect(command("pollActions", {{"ownerId", "plugin_one"}}).value("actions").toArray().isEmpty(),
+    expect(command("list", {{"ownerId", "plugin_one"}}).value("actions").toArray().isEmpty(),
            "dismiss removes stale queued action");
 
     const auto retiring = command("post", {{"ownerId", "plugin_one"}, {"notificationId", "retiring"},
@@ -118,7 +140,7 @@ int main() {
                                              {"state", "completed"}}).value("notification").toObject();
     expect(retired.value("actions").toArray().isEmpty() && retired.value("pendingActionIds").toArray().isEmpty(),
            "terminal patch retires implicit running actions");
-    expect(command("pollActions", {{"ownerId", "plugin_one"}}).value("actions").toArray().isEmpty(),
+    expect(command("list", {{"ownerId", "plugin_one"}}).value("actions").toArray().isEmpty(),
            "terminal transition removes pending running action");
     const auto clearedProgress = command("post", {{"ownerId", "plugin_one"}, {"notificationId", "retiring"},
                                                      {"progress", QJsonValue(QJsonValue::Null)}}).value("notification").toObject();
@@ -154,12 +176,11 @@ int main() {
                                       {"actionId", "cancel"}, {"sequence", evicting.value("sequence")}}).value("ok").toBool(),
            "action can be pending before notification eviction");
     for (int i = 0; i <= 100; ++i) post(QString("evict%1").arg(i));
-    expect(command("pollActions", {{"ownerId", "plugin_one"}}).value("actions").toArray().isEmpty(),
+    expect(command("list", {{"ownerId", "plugin_one"}}).value("actions").toArray().isEmpty(),
            "eviction removes queued action for evicted notification");
 
-    const auto *api = xem_notifications_get_api_v1();
     expect(api && api->abiVersion == XEM_NOTIFICATIONS_ABI, "C API ABI is available");
-    expect(api && api->structSize == sizeof(XemNotificationsApiV1), "C API table size matches");
+    expect(api && api->structSize == sizeof(XemNotificationsApi), "C API table size matches");
     const auto apiInput = QJsonDocument(QJsonObject{{"ownerId", "plugin_two"}, {"notificationId", "api"},
                                                     {"title", "API"}, {"message", "Posted"}})
                               .toJson(QJsonDocument::Compact);
@@ -170,12 +191,17 @@ int main() {
     expect(dismissResult && std::string(dismissResult).find("dismissed") != std::string::npos, "C API dismiss works");
     api->freeString(dismissResult);
 
-    const auto *apiV2 = xem_notifications_get_api_v2();
-    expect(apiV2 && apiV2->abiVersion == XEM_NOTIFICATIONS_V2_ABI, "C API V2 is available");
-    expect(apiV2 && apiV2->structSize == sizeof(XemNotificationsApiV2), "C API V2 table size matches");
-    char *pollResult = apiV2->pollActions("plugin_two");
-    expect(pollResult && std::string(pollResult).find("actions") != std::string::npos, "C API V2 polls actions");
-    apiV2->freeString(pollResult);
+    int changes=0;
+    const auto observer=api->subscribe("",+[](const char *,void *data){++*static_cast<int *>(data);},&changes);
+    std::thread worker([&] { auto *reply=api->post(apiInput.constData());api->freeString(reply); });
+    worker.join();
+    expect(changes==0,"worker post never invokes subscriber inline");
+    QCoreApplication::processEvents();
+    expect(changes>0,"worker post wakes application thread without polling");
+    const int before=changes;
+    post("unsubscribe");api->unsubscribe(observer);api->unsubscribe(subscription);
+    QCoreApplication::processEvents();
+    expect(changes==before,"unsubscribe cancels already queued callbacks");
 
     expect(command("clear", {{"ownerId", "plugin_one"}}).value("ok").toBool(), "clear owner succeeds");
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

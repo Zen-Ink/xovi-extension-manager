@@ -101,3 +101,17 @@ See [the baseline audit](error-classification-audit.zh-CN.md) for the enumerated
 codes and original UI/API reports. The implementation is in `src/diagnostics.h`;
 recovery advice is centralized in manager, with UI-local validation handled in UI
 so it works even when manager is unavailable.
+
+## Notification events and Socket services (0.3)
+
+These API failures never imply that restarting fixes the request. Notification
+`action-not-found` means the referenced record was invalidated; reconcile with
+the plugin's business state. `action-not-delivered` indicates an invalid lifecycle
+transition. `notification-subscription-unavailable` requires checking service
+availability, ABI, thread and duplicate owner subscriptions.
+
+Socket errors include the same structured diagnostic object. The
+[Socket API error table](https://github.com/Zen-Ink/xovi-extension-manager-sdk/blob/master/docs/managed-sockets.md)
+classifies request/lifecycle, address conflicts, filesystem safety, capacity and
+transport errors, with recovery steps. A failed service registration does not
+block xochitl startup or change plugin activation state.

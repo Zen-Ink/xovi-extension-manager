@@ -6,7 +6,7 @@ python3 "$root/tests/check-broker-exports.py"
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 
-${CXX:-c++} -std=c++17 -fPIC \
+${CXX:-c++} -std=c++17 -fPIC -pthread \
     $(pkg-config --cflags Qt6Core) \
     "$root/tests/notifications_tests.cpp" \
     "$root/src/notifications.cpp" \

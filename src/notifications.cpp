@@ -13,6 +13,13 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <memory>
+#include <map>
+#include <vector>
+#include <atomic>
+#include <QCoreApplication>
+#include <QThread>
+#include <QMetaObject>
 
 namespace {
 constexpr int kMaxNotifications = 100;
@@ -29,6 +36,20 @@ quint64 nextSequence = 1;
 quint64 revision = 0;
 quint64 nextToastRevision = 1;
 quint64 nextActionSequence = 1;
+struct Subscription {
+    QString owner;
+    XemNotificationCallback callback;
+    void *userData;
+    bool active = true;
+};
+std::map<uint64_t, std::shared_ptr<Subscription>> subscriptions;
+uint64_t nextSubscription = 1;
+std::atomic_bool dispatchPending{false};
+void scheduleDispatch();
+bool applicationThread() {
+    auto *app = QCoreApplication::instance();
+    return app && QThread::currentThread() == app->thread();
+}
 
 QJsonObject failure(const char *code) { return withDiagnostic({{"ok", false}, {"error", code}}); }
 bool validId(const QString &value) {
@@ -184,7 +205,8 @@ QJsonObject post(const QJsonObject &request) {
                 }
             if (stillAvailable) {
                 kept.append(queued);
-                pendingIds.append(queued.value("actionId"));
+                if (queued.value("status")=="queued" || queued.value("status")=="delivered")
+                    pendingIds.append(queued.value("actionId"));
             }
         }
         pendingActions = kept;
@@ -258,7 +280,10 @@ QJsonObject list(const QJsonObject &request) {
             if (!entry.value("read").toBool()) ++unread;
         }
     }
-    return {{"ok", true}, {"entries", result}, {"notifications", result}, {"unread", unread},
+    QJsonArray actions;
+    if (!owner.isEmpty()) for (const auto &value : pendingActions)
+        if (value.toObject().value("ownerId").toString() == owner) actions.append(value);
+    return {{"actions", actions}, {"ok", true}, {"entries", result}, {"notifications", result}, {"unread", unread},
             {"revision", static_cast<qint64>(revision)}, {"storage", "memory"}};
 }
 QJsonObject clear(const QJsonObject &request) {
@@ -299,11 +324,20 @@ QJsonObject actionInvoke(const QJsonObject &request) {
     for (const auto &value : pendingActions) {
         const auto queued = value.toObject();
         if (queued.value("ownerId").toString() == owner && queued.value("notificationId").toString() == id &&
-            queued.value("actionId").toString() == actionId)
+            queued.value("actionId").toString() == actionId &&
+            (queued.value("status")=="queued" || queued.value("status")=="delivered"))
             return failure("action-already-pending");
     }
-    if (pendingActions.size() >= kMaxNotifications) return failure("action-queue-full");
-    pendingActions.append(QJsonObject{{"ownerId", owner}, {"notificationId", id}, {"actionId", actionId},
+    while (pendingActions.size() >= kMaxNotifications) {
+        int finished = -1;
+        for (int i=0; i<pendingActions.size(); ++i) {
+            const auto status=pendingActions.at(i).toObject().value("status").toString();
+            if(status=="completed" || status=="failed") { finished=i; break; }
+        }
+        if(finished<0) return failure("action-queue-full");
+        pendingActions.removeAt(finished);
+    }
+    pendingActions.append(QJsonObject{{"status", "queued"}, {"ownerId", owner}, {"notificationId", id}, {"actionId", actionId},
                                       {"sequence", entry.value("sequence")},
                                       {"actionSequence", static_cast<qint64>(nextActionSequence++)}});
     auto pendingIds = entry.value("pendingActionIds").toArray();
@@ -313,28 +347,96 @@ QJsonObject actionInvoke(const QJsonObject &request) {
     ++revision;
     return {{"ok", true}, {"status", "queued"}, {"revision", static_cast<qint64>(revision)}};
 }
-QJsonObject pollActions(const QJsonObject &request) {
+QJsonObject acknowledge(const QJsonObject &request) {
     QString owner;
-    const auto ownerError = requireOwner(request, &owner);
-    if (!ownerError.isEmpty()) return ownerError;
-    QJsonArray actions, kept;
-    for (const auto &value : pendingActions) {
-        const auto queued = value.toObject();
-        if (queued.value("ownerId").toString() != owner) { kept.append(queued); continue; }
-        actions.append(queued);
-        const int index = indexOf(owner, queued.value("notificationId").toString());
-        if (index >= 0) {
-            auto entry = notifications.at(index).toObject();
-            auto pendingIds = entry.value("pendingActionIds").toArray();
-            for (int i = 0; i < pendingIds.size(); ++i)
-                if (pendingIds.at(i).toString() == queued.value("actionId").toString()) { pendingIds.removeAt(i); break; }
-            entry.insert("pendingActionIds", pendingIds);
-            notifications.replace(index, entry);
+    const auto ownerError=requireOwner(request,&owner);
+    if(!ownerError.isEmpty()) return ownerError;
+    const auto sequence=request.value("actionSequence").toInteger(-1);
+    const QString status=request.value("status").toString();
+    if(sequence<1 || (status!="completed" && status!="failed")) return failure("invalid-action-result");
+    for(int i=0;i<pendingActions.size();++i) {
+        auto action=pendingActions.at(i).toObject();
+        if(action.value("ownerId")!=owner || action.value("actionSequence").toInteger()!=sequence) continue;
+        if(action.value("status")==status) return {{"ok",true},{"status",status}};
+        if(action.value("status")!="delivered") return failure("action-not-delivered");
+        action.insert("status",status);
+        action.insert("result",request.value("result"));
+        pendingActions.replace(i,action);
+        const int index=indexOf(owner,action.value("notificationId").toString());
+        if(index>=0) {
+            auto entry=notifications.at(index).toObject();
+            auto ids=entry.value("pendingActionIds").toArray();
+            for(int j=ids.size()-1;j>=0;--j) if(ids.at(j)==action.value("actionId")) ids.removeAt(j);
+            entry.insert("pendingActionIds",ids);notifications.replace(index,entry);
+        }
+        ++revision;
+        return {{"ok",true},{"status",status},{"revision",static_cast<qint64>(revision)}};
+    }
+    return failure("action-not-found");
+}
+
+void dispatch() {
+    dispatchPending=false;
+    std::vector<std::shared_ptr<Subscription>> listeners;
+    QByteArray changed;
+    {
+        std::lock_guard<std::mutex> lock(notificationsMutex);
+        for(const auto &pair:subscriptions) listeners.push_back(pair.second);
+        changed=QJsonDocument(QJsonObject{{"type","changed"},{"revision",static_cast<qint64>(revision)}}).toJson(QJsonDocument::Compact);
+    }
+    for(const auto &listener:listeners) {
+        if(!listener->active) continue;
+        listener->callback(changed.constData(),listener->userData);
+        if(!listener->active || listener->owner.isEmpty()) continue;
+        // Claim one action at a time: a callback may dismiss, replace, or
+        // complete a notification, invalidating other queued actions.
+        for(int delivered=0;listener->active && delivered<kMaxNotifications;++delivered) {
+            QByteArray event;
+            {
+                std::lock_guard<std::mutex> lock(notificationsMutex);
+                for(int i=0;i<pendingActions.size();++i) {
+                    auto action=pendingActions.at(i).toObject();
+                    if(action.value("ownerId")!=listener->owner || action.value("status")!="queued") continue;
+                    action.insert("status","delivered");pendingActions.replace(i,action);++revision;
+                    event=QJsonDocument(QJsonObject{{"type","action"},{"action",action},
+                        {"revision",static_cast<qint64>(revision)}}).toJson(QJsonDocument::Compact);
+                    break;
+                }
+            }
+            if(event.isEmpty()) break;
+            listener->callback(event.constData(),listener->userData);
+            scheduleDispatch();
         }
     }
-    pendingActions = kept;
-    if (!actions.isEmpty()) ++revision;
-    return {{"ok", true}, {"actions", actions}, {"revision", static_cast<qint64>(revision)}};
+}
+void scheduleDispatch() {
+    auto *app=QCoreApplication::instance();
+    if(!app || dispatchPending.exchange(true)) return;
+    if(!QMetaObject::invokeMethod(app,[]{dispatch();},Qt::QueuedConnection)) dispatchPending=false;
+}
+uint64_t subscribe(const char *owner, XemNotificationCallback callback, void *userData) {
+    if(!applicationThread() || !owner || !callback) return 0;
+    const QString id=QString::fromUtf8(owner);
+    if(!id.isEmpty() && !validId(id)) return 0;
+    uint64_t handle;
+    {
+        std::lock_guard<std::mutex> lock(notificationsMutex);
+        if(subscriptions.size()>=128) return 0;
+        if(!id.isEmpty()) for(const auto &pair:subscriptions)
+            if(pair.second->owner==id) return 0;
+        handle=nextSubscription++;
+        subscriptions.emplace(handle,std::make_shared<Subscription>(Subscription{id,callback,userData}));
+    }
+    scheduleDispatch();
+    return handle;
+}
+void unsubscribe(uint64_t handle) {
+    if(!applicationThread()) return;
+    std::lock_guard<std::mutex> lock(notificationsMutex);
+    auto found=subscriptions.find(handle);
+    if(found==subscriptions.end()) return;
+    found->second->active=false;
+    subscriptions.erase(found);
 }
 QJsonObject run(const std::string &command, const QJsonObject &request) {
     if (command == "post") return post(request);
@@ -343,7 +445,7 @@ QJsonObject run(const std::string &command, const QJsonObject &request) {
     if (command == "markRead") return markRead(request);
     if (command == "clear") return clear(request);
     if (command == "actionInvoke") return actionInvoke(request);
-    if (command == "pollActions") return pollActions(request);
+    if (command == "acknowledge") return acknowledge(request);
     return failure("unknown-command");
 }
 char *apiPost(const char *description) { return owned(notificationCommand("post", description)); }
@@ -355,19 +457,15 @@ char *apiDismiss(const char *owner, const char *id) {
     return owned(notificationCommand("dismiss", request.constData()));
 }
 void apiFree(char *value) { std::free(value); }
-const XemNotificationsApiV1 api{XEM_NOTIFICATIONS_ABI, sizeof(XemNotificationsApiV1), apiPost, apiDismiss, apiFree};
-char *apiPollActions(const char *owner) {
-    if (!owner) return owned(encode(failure("invalid-owner-id")));
-    const auto request = QJsonDocument(QJsonObject{{"ownerId", QString::fromUtf8(owner)}}).toJson(QJsonDocument::Compact);
-    return owned(notificationCommand("pollActions", request.constData()));
-}
-const XemNotificationsApiV2 apiV2{XEM_NOTIFICATIONS_V2_ABI, sizeof(XemNotificationsApiV2),
-                                  apiPost, apiDismiss, apiFree, apiPollActions};
+char *apiQuery(const char *request) { return owned(notificationCommand("list",request)); }
+char *apiAcknowledge(const char *request) { return owned(notificationCommand("acknowledge",request)); }
+const XemNotificationsApi api{XEM_NOTIFICATIONS_ABI,sizeof(XemNotificationsApi),
+    apiPost,apiDismiss,apiQuery,subscribe,unsubscribe,apiAcknowledge,apiFree};
 }
 
 std::string notificationCommand(const std::string &command, const char *request) {
     if (command.empty() || command.size() > 32) return encode(failure("invalid-command"));
-    if (request && std::strlen(request) > kMaxRequestBytes) return encode(failure("request-too-large"));
+    if (request && strnlen(request, kMaxRequestBytes + 1) > kMaxRequestBytes) return encode(failure("request-too-large"));
     QJsonObject object;
     if (request && *request) {
         QJsonParseError error;
@@ -375,9 +473,16 @@ std::string notificationCommand(const std::string &command, const char *request)
         if (error.error != QJsonParseError::NoError || !document.isObject()) return encode(failure("invalid-json"));
         object = document.object();
     }
-    std::lock_guard<std::mutex> guard(notificationsMutex);
-    return encode(run(command, object));
+    QJsonObject result;
+    bool changed;
+    {
+        std::lock_guard<std::mutex> guard(notificationsMutex);
+        const auto before=revision;
+        result=run(command,object);
+        changed=before!=revision;
+    }
+    if(changed) scheduleDispatch();
+    return encode(result);
 }
 
-extern "C" const XemNotificationsApiV1 *xem_notifications_get_api_v1(void) { return &api; }
-extern "C" const XemNotificationsApiV2 *xem_notifications_get_api_v2(void) { return &apiV2; }
+extern "C" const XemNotificationsApi *xem_notifications_get_api(void) { return &api; }

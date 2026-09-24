@@ -106,23 +106,22 @@ settingsContext.notify({
 settingsContext.dismissNotification("rescan-complete")
 ```
 
-The context binds `ownerId` to the current plugin; a page cannot override it via
-this convenience API. Native code can optionally discover the getter tagged
-`xovi-extension-manager$notificationsApi = 1` using the normal XOVI metadata
-iterator. Check that the manager is initialized, the ABI is 1 and `structSize`
-is at least `sizeof(XemNotificationsApiV1)`. The table is declared in
-`sdk/xovi-notifications.h`; use its `freeString` for returned JSON. Do not add a
-mandatory manager import just to publish optional notifications.
+The context binds `ownerId` to the current plugin. Native code discovers the
+optional getter tagged `xovi-extension-manager$notificationsApi = 3`, checks ABI
+3 and `sizeof(XemNotificationsApi)`, then uses `sdk/xovi-notifications.h`.
+Returned JSON must be released using `freeString`. Manager 0.3.0 intentionally
+removes the old notification tables and polling endpoints: rebuild notification
+consumers and update manager/UI together. The SDK and a manifest are not required
+for the QML context API.
 
-The native table's `post` takes a JSON object with `ownerId`, `notificationId`,
-`title`, `message`, optional `level` (`info`, `warning`, `error`) and optional
-`pageId`. A V2 table is separately discoverable through
-`xovi-extension-manager$notificationsApiV2 = 2`; its V1-compatible prefix adds
-`pollActions(ownerId)`. Check ABI 2 and `sizeof(XemNotificationsApiV2)` before
-using that field. The broker exposes the same data via `notificationsPost`,
-`notificationsList`, `notificationsRead`, `notificationsDismiss` and
-`notificationsClear`. Read/dismiss require the owner and key; clear requires an
-owner and removes that owner's notifications. List may filter by owner.
+The native API provides `post`, `dismiss`, `subscribe`, `unsubscribe`, `query`,
+`acknowledge`. Subscribe on the application thread before querying a snapshot.
+Callbacks are queued on that thread outside store locks. The UI subscribes to
+change events and queries the current revision; there is no notification timer.
+The broker keeps `notificationsPost`, `notificationsList`, `notificationsRead`,
+`notificationsDismiss`, `notificationsClear`, `notificationsActionInvoke`, and
+adds `notificationsAcknowledge`. It is a command/query transport, not the event
+subscription channel.
 
 Posts may include `state` (`running`, `completed`, `failed`, `cancelled`),
 `progress` and up to two actions. `progress` is either `null` to clear it, or
@@ -136,20 +135,18 @@ then retain their prior values, except that a transition out of `running` clears
 old actions unless new actions are explicitly supplied. Notifications without
 progress return `progress: null`. Evicting an entry also clears its queued actions.
 
-The broker's `notificationsActionInvoke` maps to `actionInvoke` with owner,
-notification key, action key and optional entry `sequence`; a stale sequence or
-unavailable action is rejected. Valid invocation only queues the request and
-returns `queued`; it never runs plugin code. `notificationsPollActions` maps to
-`pollActions(owner)` and atomically takes that owner's pending actions. Entries
-include `pendingActionIds`, which grows on queueing and is cleared when actions
-are delivered. Repeated clicks for the same notification/action are rejected
-while pending; the action queue is bounded to 100 and reports full rather than
-discarding requests. Dismiss and clear remove relevant pending actions.
-Owner/key/page IDs use the usual manager ID rules; titles are at most 256 UTF-8
-bytes, messages 4096 bytes and requests 16 KiB. Invalid requests return an error.
-All native extensions share the process; this is not a security boundary.
+The broker's `notificationsActionInvoke` validates owner, notification, action
+and optional entry sequence, then queues the invocation. The owner subscription
+receives an `action` event. Queries retain its `queued → delivered → completed|failed`
+state; only explicit acknowledgment releases `pendingActionIds`. Repeated clicks
+remain blocked while queued or delivered. A missing consumer or missing acknowledgment
+never means success. Dismissal, clearing, eviction or retiring an action invalidates
+its record; late acknowledgments return `action-not-found`.
 
-The UI polls only this in-memory store every two seconds.
+Owner/key/page IDs use the usual manager ID rules; titles are at most 256 UTF-8
+bytes, messages 4096 bytes and requests 16 KiB. The action journal holds 100 entries,
+evicting finished records first and rejecting new work if all are pending.
+All native extensions share the process; this is not a security boundary.
 
 The firmware adapter adds a native bell switch to the vertical toggle column in
 Quick Settings (3.27 and 3.28). Its full-height drawer occupies the space entirely
@@ -160,7 +157,7 @@ actions. The manager's notification page uses the same list component.
 All short notifications use a compact white/black prompt at the screen's upper
 right, with a title and at most two message lines. Tapping it opens the drawer.
 They do not also enqueue a native notification. Prompts last five seconds and
-are rate-limited to one every six seconds; suppressed prompts remain in history.
+queue in FIFO order; updates to the same key coalesce instead of losing prompts.
 Progress updates do not restart the timeout or replay dismissed prompts. Progress
 and task controls stay in the notification center; unknown totals use a static
 pattern rather than continuous e-paper animation.
@@ -170,41 +167,26 @@ to cancel; its subsequent state update confirms the result.
 No caller-provided QML, shell command or JavaScript action is executed.
 Opening a settings page that fails also records a notification.
 
-## Task notification example (QML)
+## Events and task actions
 
-```qml
-function startImport() {
-    settingsContext.notify({
-        notificationId: "import", title: qsTr("Importing"),
-        message: qsTr("Preparing documents"), state: "running",
-        progress: {value: 0}, actions: [{id: "cancel", label: qsTr("Cancel")}]
-    })
-}
-function updateImport(fraction) {
-    settingsContext.notify({notificationId: "import", progress: {value: fraction}})
-}
-function finishImport() {
-    settingsContext.notify({notificationId: "import", state: "completed",
-                            progress: {value: 1}, message: qsTr("Done")})
-}
-Connections {
-    target: settingsContext
-    function onNotificationAction(action) {
-        if (action.notificationId === "import" && action.actionId === "cancel")
-            importController.requestCancel() // asynchronous plugin-owned operation
-    }
-}
-```
+See the SDK's [notification examples and lifecycle contract](https://github.com/Zen-Ink/xovi-extension-manager-sdk/blob/master/docs/notification-events.md)
+for native discovery, subscribe-before-query, QML actions and explicit completion.
+`settingsContext.notificationActionsEnabled = true` subscribes for the page's
+lifetime; `notificationAction(action)` delivers work, `notificationState()` queries
+state, and `completeNotificationAction(sequence, success, result)` acknowledges it.
+`notificationStateChanged()` signals when the query may have changed.
 
-Posting actions through a SettingsContext enables its one-second action polling.
-The signal runs on the UI thread: hand work to an asynchronous controller.
-The context only lives while its page is loaded. Reopening a page that expects
-pending actions can set `settingsContext.notificationActionsEnabled = true`.
-Alternatively `settingsContext.takeNotificationActions()` takes the pending
-batch manually. Use one consumer per owner; polling takes events once, without
-acknowledgment/redelivery. A native task that outlives its page should use the
-V2 API from its own controller; the manager never calls native task code from
-a button handler. An unavailable consumer leaves the action pending, not done.
+A native controller should own tasks that outlive a page. Unsubscribe before
+freeing callback data or unloading code. A delivered action is never automatically
+replayed: a new consumer queries it and reconciles the plugin's actual state.
+Callbacks must hand lengthy work to asynchronous controllers.
+
+## Managed Unix Socket services
+
+The manager also provides optional Socket ABI 1 independently of manager-ui.
+Native plugins register a named service through `xovi-sockets.h`; manager owns
+asynchronous transport and cleanup, while the plugin owns its protocol.
+See [Socket registration and external-client examples](https://github.com/Zen-Ink/xovi-extension-manager-sdk/blob/master/docs/managed-sockets.md).
 
 ## Build and check
 

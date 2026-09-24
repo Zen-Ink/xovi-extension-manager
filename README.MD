@@ -113,7 +113,7 @@ required. `settingsList`, `settingsGet`, `settingsUpdate`, `injectionsGet`,
 
 Clone with `git clone --recurse-submodules`, or run
 `git submodule update --init --recursive` after pulling. The `sdk` submodule
-pins the shared settings, navigation, notifications and QML controls API.
+pins the shared settings, navigation, notifications, Socket and QML controls API.
 The `xovi` submodule supplies the binding generator; `XOVI_REPO` can override it.
 
 Standalone build: `TOOLCHAIN_ROOT=/path/to/toolchian ./build.sh all`.
@@ -121,3 +121,21 @@ The toolchain root contains the `rmpp` and `rm2` SDK environment scripts;
 libraries and manifests are copied to `build/<arch>/`.
 
 Diagnostics: [error levels, recovery and restart semantics](docs/diagnostics.md).
+
+## Services (0.3)
+
+Notification ABI 3 replaces polling with event subscriptions and state queries.
+Delivery does not imply completion; plugins acknowledge each action's result.
+This is a breaking update: rebuild native notification consumers and update UI
+together. See [notifications](docs/launchers-and-notifications.md#notifications)
+and [SDK examples](https://github.com/Zen-Ink/xovi-extension-manager-sdk/blob/master/docs/notification-events.md).
+
+Socket ABI 1 lets native plugins register named Unix Socket services for external
+clients, independently of manager-ui. Manager owns asynchronous connections and
+cleanup; plugins own their business protocol. See the
+[registration/client guide](https://github.com/Zen-Ink/xovi-extension-manager-sdk/blob/master/docs/managed-sockets.md).
+The normal plugin Makefile now links Qt6Network; no extra daemon or build tree is used.
+
+Native regression runners: `sh tests/run-notifications-tests.sh` and
+`sh tests/run-sockets-tests.sh`. These compile host test executables; the Socket
+test exercises real local connections, framing, cancellation and path conflicts.
